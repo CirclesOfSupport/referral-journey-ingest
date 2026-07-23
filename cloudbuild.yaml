@@ -1,0 +1,19 @@
+# Env vars, memory, and request-timeout are set in the Cloud Run CONSOLE, not here —
+# the continuous-deploy trigger ignores those flags in cloudbuild.yaml (the contacts-sync
+# OOM lesson). This file only builds + deploys the revision.
+steps:
+  - name: gcr.io/cloud-builders/docker
+    args: ['build', '-t', 'us-east1-docker.pkg.dev/$PROJECT_ID/cloud-run-source-deploy/referral-journey-ingest', '.']
+  - name: gcr.io/cloud-builders/docker
+    args: ['push', 'us-east1-docker.pkg.dev/$PROJECT_ID/cloud-run-source-deploy/referral-journey-ingest']
+  - name: gcr.io/google.com/cloudsdktool/cloud-sdk
+    entrypoint: gcloud
+    args:
+      - run
+      - deploy
+      - referral-journey-ingest
+      - --image=us-east1-docker.pkg.dev/$PROJECT_ID/cloud-run-source-deploy/referral-journey-ingest
+      - --region=us-east1
+      - --no-allow-unauthenticated
+images:
+  - us-east1-docker.pkg.dev/$PROJECT_ID/cloud-run-source-deploy/referral-journey-ingest
