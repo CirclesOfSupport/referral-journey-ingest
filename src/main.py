@@ -3,7 +3,8 @@ referral-journey-ingest — Cloud Run service.
 
 Populates the `flow` tab (subscriber journey through the yellow outreach flow)
 and self-heals missing `Referrals` rows, by reading the TextIt runs API for
-three flows: the DKJ yellow flow (entry/response/provider) and the two partner
+three flows: the "yellow" outreach flow Request Call for Support (Yellow)
+(entry/response/provider) and the two partner
 flows (ACMF / V4W) for the actual referral timestamp + fired/logged status.
 
 Design notes:
@@ -45,7 +46,7 @@ TEXTIT_BASE = "https://textit.com/api/v2"
 TEXTIT_TOKEN = os.environ.get("TEXTIT_TOKEN")  # set in console; or Secret Manager (see README)
 
 # Flow UUIDs
-DKJ_FLOW = os.environ["DKJ_FLOW"]      # outreach ("yellow") flow UUID
+YELLOW_FLOW = os.environ["YELLOW_FLOW"]  # "Request Call for Support (Yellow)" flow UUID
 ACMF_FLOW = os.environ["ACMF_FLOW"]    # partner referral flow UUID
 V4W_FLOW = os.environ["V4W_FLOW"]      # partner referral flow UUID
 
@@ -200,8 +201,8 @@ def referrals_has_uuid(uuid):
 
 
 # ---------------------------------------------------------------- extraction
-def dkj_row(run):
-    """Journey fields from a DKJ run, or None if out of scope.
+def yellow_flow_row(run):
+    """Journey fields from a yellow-flow run, or None if out of scope.
 
     Scope (option 1): a run is logged only if `provider` is set. `provider` is
     saved on the AZ/Other state branches, which are reachable ONLY down the
@@ -273,13 +274,13 @@ def run_ingest(rebuild=False):
             if prev is None or rec["created_on"] >= prev["created_on"]:
                 partner[uuid] = rec
 
-    # 2) DKJ runs -> journey rows (scoped to provider-present)
-    after = None if rebuild else get_watermark("dkj")
+    # 2) yellow outreach flow runs -> journey rows (scoped to provider-present)
+    after = None if rebuild else get_watermark("yellow")
     new_wm = after
     stats = {"flow_rows": 0, "inserted": 0, "updated": 0, "self_heals": 0, "skipped_no_provider": 0}
-    for run in iter_runs(DKJ_FLOW, after=after):
+    for run in iter_runs(YELLOW_FLOW, after=after):
         new_wm = _max_iso(new_wm, run.get("modified_on"))
-        row = dkj_row(run)
+        row = yellow_flow_row(run)
         if row is None:
             stats["skipped_no_provider"] += 1
             continue
@@ -296,7 +297,7 @@ def run_ingest(rebuild=False):
         stats["flow_rows"] += 1
         stats[result] += 1
     if new_wm:
-        set_watermark("dkj", new_wm)
+        set_watermark("yellow", new_wm)
 
     # 3) self-heal: partner referral fired but sheet_log did NOT succeed AND
     #    no Referrals row exists -> write the missing Referrals row

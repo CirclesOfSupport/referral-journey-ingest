@@ -1,8 +1,9 @@
 # referral-journey-ingest
 
-Cloud Run service that populates the **`flow`** tab (subscriber journey through the
-"yellow" outreach flow `Call for Support (DKJ)`) in the External Referral Log workbook,
-and **self-heals** missing `Referrals` rows.
+Cloud Run service that populates the **`flow`** tab in the External Referral Log
+workbook — the subscriber journey through the outreach flow
+**`Request Call for Support (Yellow)`** (the "yellow", non-crisis referral offer) — and
+**self-heals** missing `Referrals` rows.
 
 It reads the TextIt **runs API** for three flows and writes to Google Sheets via
 `sheet-service`. It does NOT write from inside any TextIt flow — reading runs means a
@@ -15,14 +16,14 @@ which in-flow sheet writes would miss.
 
 | Column | Source |
 |---|---|
-| `uuid` | DKJ run `contact.uuid` |
-| `entry_timestamp` | DKJ run `created_on` |
-| `provider` | DKJ run `values.provider.value` (`ACMF` / `Vets4Warriors`) |
-| `response` | DKJ run `values."Result 1".category` (`Yes`/`No`/`Other`; **blank = no response**) |
+| `uuid` | outreach flow run `contact.uuid` |
+| `entry_timestamp` | outreach flow run `created_on` |
+| `provider` | outreach flow run `values.provider.value` (`ACMF` / `Vets4Warriors`) |
+| `response` | outreach flow run `values."Result 1".category` (`Yes`/`No`/`Other`; **blank = no response**) |
 | `referral_timestamp` | latest partner run `values.acmf_submission.time` / `values.v4w_submission.time` |
 | `referral_fired` | `yes` if the partner submission `category=Success`; `no` if response was Yes but no successful partner submission; blank otherwise |
 
-**Scope (option 1):** only DKJ runs where `provider` is set. `provider` is saved on the
+**Scope:** only outreach flow runs where `provider` is set. `provider` is saved on the
 AZ/Other state branches, reachable only down the Veteran path of the usertype split, so
 provider-present == a veteran who reached the offer. `runs.json` does NOT expose
 `contact.fields`, so `usertype` can't be read directly — provider-presence is the proxy.
@@ -49,7 +50,7 @@ failure directly via its own `sheet_log` result — no sheet-diffing required.
      flow_key STRING, watermark STRING
    );
    ```
-   Keys used: `dkj`, `acmf`, `v4w`. Empty table => first run behaves like a full pull
+   Keys used: `yellow`, `acmf`, `v4w`. Empty table => first run behaves like a full pull
    (no `after` filter) and then records watermarks.
 
 ## Endpoints
@@ -71,7 +72,7 @@ The continuous-deploy trigger ignores env/memory/timeout flags in `cloudbuild.ya
 - `TEXTIT_TOKEN` — TextIt API token (or wire Secret Manager; see below)
 - `SHEET_PASSWORD` — the `gappscriptapi` value sheet-service checks
 - `SHEET_ID` — the External Referral Log workbook id
-- `DKJ_FLOW`, `ACMF_FLOW`, `V4W_FLOW` — flow UUIDs (defaults baked in)
+- `YELLOW_FLOW`, `ACMF_FLOW`, `V4W_FLOW` — flow UUIDs
 - `PAGE_CEILING=500` — runtime seatbelt on pagination
 - **Request timeout = 3600** (Container tab) — a rebuild pages many runs; 300s default 504s mid-crawl.
 
