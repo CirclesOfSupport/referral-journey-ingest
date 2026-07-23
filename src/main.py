@@ -36,8 +36,8 @@ log = logging.getLogger("referral-journey-ingest")
 app = Flask(__name__)
 
 # ---- config (console env vars, NOT cloudbuild.yaml) ----
-PROJECT = os.environ.get("GCP_PROJECT", "early-alert-responses")
-SECRET_PROJECT = os.environ.get("SECRET_PROJECT", "early-alert-responses")
+PROJECT = os.environ["GCP_PROJECT"]
+SECRET_PROJECT = os.environ.get("SECRET_PROJECT", PROJECT)
 WATERMARK_TABLE = os.environ.get("WATERMARK_TABLE", "RESPONSES.referral_journey_watermark")
 
 # TextIt
@@ -45,13 +45,13 @@ TEXTIT_BASE = "https://textit.com/api/v2"
 TEXTIT_TOKEN = os.environ.get("TEXTIT_TOKEN")  # set in console; or Secret Manager (see README)
 
 # Flow UUIDs
-DKJ_FLOW = os.environ.get("DKJ_FLOW", "58b04f61-cd6b-4d0b-a54d-7397d905f3aa")
-ACMF_FLOW = os.environ.get("ACMF_FLOW", "08132793-eeff-4341-95af-c3365d605ce0")
-V4W_FLOW = os.environ.get("V4W_FLOW", "be5708eb-fcbc-4d6f-83a4-e23940018863")
+DKJ_FLOW = os.environ["DKJ_FLOW"]      # outreach ("yellow") flow UUID
+ACMF_FLOW = os.environ["ACMF_FLOW"]    # partner referral flow UUID
+V4W_FLOW = os.environ["V4W_FLOW"]      # partner referral flow UUID
 
 # sheet-service
-SHEET_SERVICE = os.environ.get("SHEET_SERVICE", "https://sheet-service-853176470965.us-east1.run.app")
-SHEET_ID = os.environ.get("SHEET_ID", "1CquixL95khVlhSrzWjSGetAevFX2-_kl2RgjFe0Q1hI")
+SHEET_SERVICE = os.environ["SHEET_SERVICE"]
+SHEET_ID = os.environ["SHEET_ID"]
 FLOW_TAB = os.environ.get("FLOW_TAB", "flow")
 REFERRALS_TAB = os.environ.get("REFERRALS_TAB", "Referrals")
 SHEET_PASSWORD = os.environ.get("SHEET_PASSWORD")  # gappscriptapi value; from Secret Manager in prod

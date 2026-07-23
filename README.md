@@ -45,7 +45,7 @@ failure directly via its own `sheet_log` result — no sheet-diffing required.
 
 2. **Watermark table** (BigQuery):
    ```sql
-   CREATE TABLE IF NOT EXISTS `early-alert-responses.RESPONSES.referral_journey_watermark` (
+   CREATE TABLE IF NOT EXISTS `<GCP_PROJECT>.RESPONSES.referral_journey_watermark` (
      flow_key STRING, watermark STRING
    );
    ```
@@ -67,10 +67,10 @@ POST /run     -> full rebuild:  body {"rebuild": true}   (ignores watermarks, re
 The continuous-deploy trigger ignores env/memory/timeout flags in `cloudbuild.yaml`
 (the contacts-sync OOM lesson). Set in the console (Edit & deploy revision):
 
-- `GCP_PROJECT=early-alert-responses`
+- `GCP_PROJECT` — GCP project id
 - `TEXTIT_TOKEN` — TextIt API token (or wire Secret Manager; see below)
 - `SHEET_PASSWORD` — the `gappscriptapi` value sheet-service checks
-- `SHEET_ID=1CquixL95khVlhSrzWjSGetAevFX2-_kl2RgjFe0Q1hI`
+- `SHEET_ID` — the External Referral Log workbook id
 - `DKJ_FLOW`, `ACMF_FLOW`, `V4W_FLOW` — flow UUIDs (defaults baked in)
 - `PAGE_CEILING=500` — runtime seatbelt on pagination
 - **Request timeout = 3600** (Container tab) — a rebuild pages many runs; 300s default 504s mid-crawl.
