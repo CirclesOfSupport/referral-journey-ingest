@@ -213,18 +213,29 @@ def referrals_has_uuid(uuid):
 def yellow_flow_row(run):
     """Journey fields from a yellow-flow run, or None if out of scope.
 
-    Scope (option 1): a run is logged only if `provider` is set. `provider` is
-    saved on the AZ/Other state branches, which are reachable ONLY down the
-    Veteran path of the usertype split — so provider-present == a veteran who
-    reached the referral offer. runs.json does not expose contact.fields, so
-    usertype cannot be read directly; provider-presence is the proxy. The only
-    population this misses is veterans who exited between the usertype split and
-    the offer, who were never actually offered a referral.
+    Scope: a run is logged if it reached the referral offer, established by
+    `provider` OR (for runs predating that result node) `providerdescription`.
+    Both are saved on the AZ/Other state branches, reachable ONLY down the
+    Veteran path of the usertype split — so their presence means a veteran who
+    reached the offer. runs.json does not expose contact.fields, so usertype
+    cannot be read directly. The only population this misses is veterans who
+    exited between the usertype split and the offer, who were never offered a
+    referral.
     """
     values = run.get("values") or {}
     provider = (values.get("provider") or {}).get("value", "")
     if not provider:
-        return None  # out of scope: never reached the offer
+        # Runs that predate the `provider` result node (added 2026-07-23) have no
+        # provider value, but they DO carry providerdescription, whose text is
+        # partner-specific. Derive from it rather than dropping the run — this is
+        # recorded data, not an assumption, and it keeps the pilot cohort visible.
+        desc = (values.get("providerdescription") or {}).get("value", "") or ""
+        if "Vets4Warriors" in desc:
+            provider = "Vets4Warriors"
+        elif "Arizona" in desc:
+            provider = "ACMF"
+    if not provider:
+        return None  # never reached the offer (no provider AND no description)
     # NOTE: runs.json normalizes result names into snake_case keys — the flow's
     # "Result 1" is exposed as `result_1` (and e.g. ProviderDescription as
     # `providerdescription`). Looking up the display name never matches.
