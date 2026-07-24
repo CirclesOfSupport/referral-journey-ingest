@@ -29,7 +29,6 @@ from datetime import datetime, timezone
 
 import requests
 from flask import Flask, request, jsonify
-from google.cloud import bigquery
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("referral-journey-ingest")
@@ -37,9 +36,6 @@ log = logging.getLogger("referral-journey-ingest")
 app = Flask(__name__)
 
 # ---- config (console env vars, NOT cloudbuild.yaml) ----
-PROJECT = os.environ["GCP_PROJECT"]
-SECRET_PROJECT = os.environ.get("SECRET_PROJECT", PROJECT)
-WATERMARK_TABLE = os.environ.get("WATERMARK_TABLE", "RESPONSES.referral_journey_watermark")
 
 # TextIt
 TEXTIT_BASE = "https://textit.com/api/v2"
@@ -59,8 +55,6 @@ SHEET_PASSWORD = os.environ.get("SHEET_PASSWORD")  # gappscriptapi value; from S
 
 # runtime seatbelt
 PAGE_CEILING = int(os.environ.get("PAGE_CEILING", "500"))
-
-bq = bigquery.Client(project=PROJECT)
 
 
 # ---------------------------------------------------------------- TextIt reads
@@ -106,28 +100,31 @@ def iter_runs(flow_uuid, after=None):
 
 
 # ---------------------------------------------------------------- watermark
-def get_watermark(flow_key):
-    q = f"SELECT watermark FROM `{PROJECT}.{WATERMARK_TABLE}` WHERE flow_key=@k"
-    job = bq.query(q, job_config=bigquery.QueryJobConfig(
-        query_parameters=[bigquery.ScalarQueryParameter("k", "STRING", flow_key)]))
-    for row in job.result():
-        return row["watermark"]
-    return None
+def sheet_watermark():
+    """Watermark derived from the sheet itself — max(last_modified) in the Flow tab.
 
+    No state table: the Flow tab's `last_modified` column stores each run's
+    TextIt `modified_on`. Using modified_on (not entry_timestamp) is what makes
+    late responses work: a subscriber who entered Monday and replies Wednesday
+    has an old entry time but a fresh modified_on, so they are still picked up.
 
-def set_watermark(flow_key, value):
-    # MERGE upsert (single-row) — table is (flow_key STRING, watermark STRING)
-    q = f"""
-    MERGE `{PROJECT}.{WATERMARK_TABLE}` T
-    USING (SELECT @k AS flow_key, @v AS watermark) S
-    ON T.flow_key = S.flow_key
-    WHEN MATCHED THEN UPDATE SET watermark = S.watermark
-    WHEN NOT MATCHED THEN INSERT (flow_key, watermark) VALUES (S.flow_key, S.watermark)
+    Returns None when the tab is empty (=> full pull, which is correct on first run).
+    The same value is used as the `after` filter for the partner flows too. That
+    can over-pull them slightly (their runs may have been modified before this
+    point) but never under-pulls, so nothing is missed; the upsert is idempotent.
     """
-    bq.query(q, job_config=bigquery.QueryJobConfig(query_parameters=[
-        bigquery.ScalarQueryParameter("k", "STRING", flow_key),
-        bigquery.ScalarQueryParameter("v", "STRING", value),
-    ])).result()
+    r = requests.post(f"{SHEET_SERVICE}/read", json={
+        "password": SHEET_PASSWORD,
+        "sheetid": SHEET_ID,
+        "tab": FLOW_TAB,
+        "mode": "all",
+        "columns": ["last_modified"],
+    }, timeout=60)
+    r.raise_for_status()
+    rows = r.json().get("rows") or []
+    vals = [str(x.get("last_modified") or "").strip() for x in rows]
+    vals = [v for v in vals if v]
+    return max(vals) if vals else None
 
 
 def _max_iso(a, b):
@@ -160,6 +157,7 @@ def upsert_flow_row(row):
         "response": row.get("response", ""),
         "referral_timestamp": row.get("referral_timestamp", ""),
         "referral_fired": row.get("referral_fired", ""),
+        "last_modified": row.get("modified_on", ""),
     }
     upd = _sheet_write({**data, "newrow": "no"})
     if upd.get("matched", 0) == 0:
@@ -237,14 +235,12 @@ def partner_referral(run, submission_key):
     return ts, fired, logged
 
 
-def collect_partner(flow_uuid, submission_key, wm_key, rebuild):
+def collect_partner(flow_uuid, submission_key, after):
     """Read a partner flow's runs; return {uuid: {ts, fired, logged, created_on}}
-    keeping the LATEST run per uuid (max created_on). Advances its watermark."""
-    after = None if rebuild else get_watermark(wm_key)
+    keeping the LATEST run per uuid (max created_on). `after` is the shared
+    sheet-derived watermark (None => full pull)."""
     latest = {}
-    new_wm = after
     for run in iter_runs(flow_uuid, after=after):
-        new_wm = _max_iso(new_wm, run.get("modified_on"))
         uuid = (run.get("contact") or {}).get("uuid")
         if not uuid:
             continue
@@ -254,17 +250,17 @@ def collect_partner(flow_uuid, submission_key, wm_key, rebuild):
         if prev is None or created >= prev["created_on"]:
             latest[uuid] = {"ts": ts, "fired": fired, "logged": logged, "created_on": created,
                             "provider": ("ACMF" if submission_key == "acmf_submission" else "Vets4Warriors")}
-    if new_wm and not rebuild:
-        set_watermark(wm_key, new_wm)
-    elif rebuild and new_wm:
-        set_watermark(wm_key, new_wm)
     return latest
 
 
 def run_ingest(rebuild=False):
+    # Single watermark derived from the Flow tab (max last_modified). Used for all
+    # three flows; None on a rebuild or an empty tab => full pull.
+    after = None if rebuild else sheet_watermark()
+
     # 1) partner runs first — build the referral lookup used to enrich journey rows
-    acmf = collect_partner(ACMF_FLOW, "acmf_submission", "acmf", rebuild)
-    v4w = collect_partner(V4W_FLOW, "v4w_submission", "v4w", rebuild)
+    acmf = collect_partner(ACMF_FLOW, "acmf_submission", after)
+    v4w = collect_partner(V4W_FLOW, "v4w_submission", after)
 
     # merged partner lookup: latest across whichever partner the uuid hit
     partner = {}
@@ -275,11 +271,8 @@ def run_ingest(rebuild=False):
                 partner[uuid] = rec
 
     # 2) yellow outreach flow runs -> journey rows (scoped to provider-present)
-    after = None if rebuild else get_watermark("yellow")
-    new_wm = after
     stats = {"flow_rows": 0, "inserted": 0, "updated": 0, "self_heals": 0, "skipped_no_provider": 0}
     for run in iter_runs(YELLOW_FLOW, after=after):
-        new_wm = _max_iso(new_wm, run.get("modified_on"))
         row = yellow_flow_row(run)
         if row is None:
             stats["skipped_no_provider"] += 1
@@ -296,8 +289,6 @@ def run_ingest(rebuild=False):
         result = upsert_flow_row(row)
         stats["flow_rows"] += 1
         stats[result] += 1
-    if new_wm:
-        set_watermark("yellow", new_wm)
 
     # 3) self-heal: partner referral fired but sheet_log did NOT succeed AND
     #    no Referrals row exists -> write the missing Referrals row

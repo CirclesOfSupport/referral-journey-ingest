@@ -22,6 +22,7 @@ which in-flow sheet writes would miss.
 | `response` | outreach flow run `values."Result 1".category` (`Yes`/`No`/`Other`; **blank = no response**) |
 | `referral_timestamp` | latest partner run `values.acmf_submission.time` / `values.v4w_submission.time` |
 | `referral_fired` | `yes` if the partner submission `category=Success`; `no` if response was Yes but no successful partner submission; blank otherwise |
+| `last_modified` | outreach flow run `modified_on` — **this column is the watermark source** |
 
 **Scope:** only outreach flow runs where `provider` is set. `provider` is saved on the
 AZ/Other state branches, reachable only down the Veteran path of the usertype split, so
@@ -40,18 +41,14 @@ failure directly via its own `sheet_log` result — no sheet-diffing required.
 ## One-time setup
 
 1. **`flow` tab header row** — create the tab with exactly these headers in row 1:
-   `uuid | entry_timestamp | provider | response | referral_timestamp | referral_fired`
+   `uuid | entry_timestamp | provider | response | referral_timestamp | referral_fired | last_modified`
    (sheet-service `newrow:yes` scans the `uuid` key column for the first empty row; the
    header must exist or column mapping fails.)
 
-2. **Watermark table** (BigQuery):
-   ```sql
-   CREATE TABLE IF NOT EXISTS `<GCP_PROJECT>.RESPONSES.referral_journey_watermark` (
-     flow_key STRING, watermark STRING
-   );
-   ```
-   Keys used: `yellow`, `acmf`, `v4w`. Empty table => first run behaves like a full pull
-   (no `after` filter) and then records watermarks.
+2. **No watermark table needed.** The watermark is derived from the sheet itself:
+   `max(last_modified)` across the `Flow` tab, read via sheet-service
+   `/read` `mode:"all"` with `columns:["last_modified"]`. An empty tab => no
+   watermark => full pull, which is correct on first run.
 
 ## Endpoints
 
@@ -68,10 +65,11 @@ POST /run     -> full rebuild:  body {"rebuild": true}   (ignores watermarks, re
 The continuous-deploy trigger ignores env/memory/timeout flags in `cloudbuild.yaml`
 (the contacts-sync OOM lesson). Set in the console (Edit & deploy revision):
 
-- `GCP_PROJECT` — GCP project id
 - `TEXTIT_TOKEN` — TextIt API token (or wire Secret Manager; see below)
 - `SHEET_PASSWORD` — the `gappscriptapi` value sheet-service checks
 - `SHEET_ID` — the External Referral Log workbook id
+- `SHEET_SERVICE` — sheet-service base URL
+- `FLOW_TAB=Flow` — **must be set**; the tab is `Flow` (capital F) and the code default is lowercase `flow`
 - `YELLOW_FLOW`, `ACMF_FLOW`, `V4W_FLOW` — flow UUIDs
 - `PAGE_CEILING=500` — runtime seatbelt on pagination
 - **Request timeout = 3600** (Container tab) — a rebuild pages many runs; 300s default 504s mid-crawl.
