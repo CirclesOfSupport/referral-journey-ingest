@@ -55,6 +55,11 @@ SHEET_PASSWORD = os.environ.get("SHEET_PASSWORD")  # gappscriptapi value; from S
 
 # runtime seatbelt
 PAGE_CEILING = int(os.environ.get("PAGE_CEILING", "500"))
+# Google Sheets API allows 60 read requests/min/user, and sheet-service reads the
+# header row on every /write. Pace writes so a large rebuild cannot exceed it.
+# 1.1s => ~54 writes/min, just under the limit. Incremental runs are far smaller
+# and unaffected in practice.
+WRITE_PACE_SEC = float(os.environ.get("WRITE_PACE_SEC", "1.1"))
 
 
 # ---------------------------------------------------------------- TextIt reads
@@ -154,9 +159,33 @@ def _sheet_write(body, allow_404=False):
     return r.json()
 
 
-def upsert_flow_row(row):
-    """Update the contact's `flow` row in place if present, else append.
-    Keyed on uuid. Two-step: try newrow:no; if matched==0, newrow:yes."""
+def existing_flow_uuids():
+    """One read of the Flow tab -> {uuid: True}.
+
+    Google's Sheets API allows 60 READ requests per minute per user, and
+    sheet-service reads the header row on EVERY /write call. Probing each row
+    with an update-then-insert pattern therefore burned the quota almost
+    immediately (HttpError 429 ReadRequestsPerMinutePerUser, limit 60).
+
+    Reading the tab once up front and deciding insert-vs-update locally removes
+    the probe entirely: one read total, then exactly one write per row.
+    """
+    r = requests.post(f"{SHEET_SERVICE}/read", json={
+        "password": SHEET_PASSWORD,
+        "sheetid": SHEET_ID,
+        "tab": FLOW_TAB,
+        "mode": "all",
+        "columns": ["uuid"],
+    }, timeout=60)
+    r.raise_for_status()
+    rows = r.json().get("rows") or []
+    return {str(x.get("uuid") or "").strip(): True
+            for x in rows if str(x.get("uuid") or "").strip()}
+
+
+def write_flow_row(row, exists):
+    """Write one row: update in place when `exists`, else append. Exactly one
+    sheet-service call — the caller already knows which, from existing_flow_uuids()."""
     data = {
         "tab": FLOW_TAB,
         "key": "uuid",
@@ -168,13 +197,16 @@ def upsert_flow_row(row):
         "referral_fired": row.get("referral_fired", ""),
         "last_modified": row.get("modified_on", ""),
     }
-    # Update in place first. sheet-service answers 404 when the uuid is not on the
-    # tab yet (not an error), and 200 {"matched":N} when it updated.
-    upd = _sheet_write({**data, "newrow": "no"}, allow_404=True)
-    if upd is None or upd.get("matched", 0) == 0:
+    if exists:
+        # 404 here would mean the row vanished between the read and now; treat as
+        # append rather than failing the whole run.
+        res = _sheet_write({**data, "newrow": "no"}, allow_404=True)
+        if res is not None and res.get("matched", 0) > 0:
+            return "updated"
         _sheet_write({**data, "newrow": "yes"})
         return "inserted"
-    return "updated"
+    _sheet_write({**data, "newrow": "yes"})
+    return "inserted"
 
 
 def heal_referral_row(uuid, referral_ts, provider):
@@ -192,21 +224,23 @@ def heal_referral_row(uuid, referral_ts, provider):
     })
 
 
-def referrals_has_uuid(uuid):
-    """Check the Referrals tab for an existing row via sheet-service /read match."""
+def existing_referral_uuids():
+    """One read of the Referrals tab -> {uuid: True}.
+
+    Same reason as existing_flow_uuids(): checking each uuid individually would
+    issue one read per candidate and blow the 60/min Sheets read quota.
+    """
     r = requests.post(f"{SHEET_SERVICE}/read", json={
         "password": SHEET_PASSWORD,
         "sheetid": SHEET_ID,
         "tab": REFERRALS_TAB,
-        "mode": "match",
-        "key": "uuid",
-        "uuid": uuid,
+        "mode": "all",
         "columns": ["uuid"],
     }, timeout=60)
     r.raise_for_status()
-    data = r.json()
-    # /read match returns {"status":"success","rows":[{...}]}; empty rows => not present
-    return bool(data.get("rows"))
+    rows = r.json().get("rows") or []
+    return {str(x.get("uuid") or "").strip(): True
+            for x in rows if str(x.get("uuid") or "").strip()}
 
 
 # ---------------------------------------------------------------- extraction
@@ -296,6 +330,9 @@ def run_ingest(rebuild=False):
                 partner[uuid] = rec
 
     # 2) yellow outreach flow runs -> journey rows (scoped to provider-present)
+    # One read of the tab, so each row costs exactly one write (Sheets API allows
+    # only 60 reads/min/user and sheet-service reads the header on every write).
+    existing = existing_flow_uuids()
     stats = {"flow_rows": 0, "inserted": 0, "updated": 0, "self_heals": 0, "skipped_no_provider": 0}
     for run in iter_runs(YELLOW_FLOW, after=after):
         row = yellow_flow_row(run)
@@ -311,15 +348,17 @@ def run_ingest(rebuild=False):
         else:
             row["referral_timestamp"] = ""
             row["referral_fired"] = "no" if row["response"] == "Yes" else ""
-        result = upsert_flow_row(row)
+        result = write_flow_row(row, row["uuid"] in existing)
+        time.sleep(WRITE_PACE_SEC)
         stats["flow_rows"] += 1
         stats[result] += 1
 
     # 3) self-heal: partner referral fired but sheet_log did NOT succeed AND
     #    no Referrals row exists -> write the missing Referrals row
+    referral_uuids = existing_referral_uuids()
     for uuid, rec in partner.items():
         if rec["fired"] and not rec["logged"]:
-            if not referrals_has_uuid(uuid):
+            if uuid not in referral_uuids:
                 heal_referral_row(uuid, rec["ts"], rec["provider"])
                 stats["self_heals"] += 1
 
