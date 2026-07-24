@@ -62,10 +62,10 @@ POST /run     -> full rebuild:  body {"rebuild": true}   (ignores watermarks, re
 
 ## Config — Cloud Run CONSOLE env vars (NOT cloudbuild.yaml)
 
-The continuous-deploy trigger ignores env/memory/timeout flags in `cloudbuild.yaml`
-(the contacts-sync OOM lesson). Set in the console (Edit & deploy revision):
+The continuous-deploy trigger does not read env, memory, or timeout flags from
+`cloudbuild.yaml`. Set them in the console (Edit & deploy revision):
 
-- `TEXTIT_TOKEN` — TextIt API token (or wire Secret Manager; see below)
+- `TEXTIT_TOKEN` — TextIt API token
 - `SHEET_PASSWORD` — the `gappscriptapi` value sheet-service checks
 - `SHEET_ID` — the External Referral Log workbook id
 - `SHEET_SERVICE` — sheet-service base URL
@@ -74,24 +74,17 @@ The continuous-deploy trigger ignores env/memory/timeout flags in `cloudbuild.ya
 - `PAGE_CEILING=500` — runtime seatbelt on pagination
 - **Request timeout = 3600** (Container tab) — a rebuild pages many runs; 300s default 504s mid-crawl.
 
-Secrets (`TEXTIT_TOKEN`, `SHEET_PASSWORD`) should live in Secret Manager and be mounted
-as env vars via the console rather than pasted as plain env values, matching the rest of
-the stack. Grant the runtime SA `secretmanager.versions.access` at project IAM (Editor
-does NOT include it — the documented Secret Accessor gotcha).
-
 ## Rate limit
 
 Every TextIt call goes through `_textit_get()`, which on HTTP 429 parses the
 `"available in N seconds"` body and sleeps N+3 before retrying. TextIt's REST limit is
-2,500 requests/hour per token; incremental pulls are small (only runs modified since the
-last watermark), but a rebuild can be large — run rebuilds off-hours and never inside the
-3-5 AM CT Meridian ETL window. This service shares the token budget with every other
-TextIt-hitting job (see the `2026-07-22_textit_rate_limit_audit` handoff).
+2,500 requests/hour per token. Incremental pulls are small (only runs modified since the
+last watermark), but a rebuild can be large, so run rebuilds off-hours. The budget is per
+token, so it is shared with any other job using the same one — schedule accordingly.
 
 ## Deploy
 
-Standard Early Alert Cloud Run service pattern (see `cloud_run_service_deploy` runbook):
-public repo `CirclesOfSupport/referral-journey-ingest`, Cloud Build continuous-deploy trigger
-on push to `main`, `--no-allow-unauthenticated`. Cloud Scheduler job calls `/run` with an
-OIDC token on the chosen cadence (hourly suggested, staggered off the top-of-hour if it
-would collide with `webhook-log-ingest-hourly`).
+Cloud Build continuous-deploy trigger on push to `main`; Cloud Run service deployed with
+`--no-allow-unauthenticated`. A Cloud Scheduler job calls `/run` with an OIDC token on the
+chosen cadence (hourly suggested; stagger it off the top of the hour if other scheduled
+jobs share the TextIt token).

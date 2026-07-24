@@ -39,7 +39,7 @@ app = Flask(__name__)
 
 # TextIt
 TEXTIT_BASE = "https://textit.com/api/v2"
-TEXTIT_TOKEN = os.environ.get("TEXTIT_TOKEN")  # set in console; or Secret Manager (see README)
+TEXTIT_TOKEN = os.environ.get("TEXTIT_TOKEN")  # set in console
 
 # Flow UUIDs
 YELLOW_FLOW = os.environ["YELLOW_FLOW"]  # "Request Call for Support (Yellow)" flow UUID
@@ -51,7 +51,7 @@ SHEET_SERVICE = os.environ["SHEET_SERVICE"].rstrip("/")  # tolerate a trailing s
 SHEET_ID = os.environ["SHEET_ID"]
 FLOW_TAB = os.environ.get("FLOW_TAB", "flow")
 REFERRALS_TAB = os.environ.get("REFERRALS_TAB", "Referrals")
-SHEET_PASSWORD = os.environ.get("SHEET_PASSWORD")  # gappscriptapi value; from Secret Manager in prod
+SHEET_PASSWORD = os.environ.get("SHEET_PASSWORD")  # gappscriptapi value sheet-service checks
 
 # runtime seatbelt
 PAGE_CEILING = int(os.environ.get("PAGE_CEILING", "500"))
@@ -278,7 +278,7 @@ def yellow_flow_row(run):
         "uuid": (run.get("contact") or {}).get("uuid"),
         "entry_timestamp": run.get("created_on", ""),
         "provider": provider,
-        "response": "" if resp in ("", None) else resp,  # blank cell = no response (Dina's encoding)
+        "response": "" if resp in ("", None) else resp,  # blank cell = no response
         "modified_on": run.get("modified_on", ""),
     }
 
