@@ -225,7 +225,10 @@ def yellow_flow_row(run):
     provider = (values.get("provider") or {}).get("value", "")
     if not provider:
         return None  # out of scope: never reached the offer
-    resp = (values.get("Result 1") or {}).get("category", "")  # Yes / No / Other / "" (no response)
+    # NOTE: runs.json normalizes result names into snake_case keys — the flow's
+    # "Result 1" is exposed as `result_1` (and e.g. ProviderDescription as
+    # `providerdescription`). Looking up the display name never matches.
+    resp = (values.get("result_1") or {}).get("category", "")  # Yes / No / Other / "" (no response)
     return {
         "uuid": (run.get("contact") or {}).get("uuid"),
         "entry_timestamp": run.get("created_on", ""),
