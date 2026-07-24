@@ -47,7 +47,7 @@ ACMF_FLOW = os.environ["ACMF_FLOW"]    # partner referral flow UUID
 V4W_FLOW = os.environ["V4W_FLOW"]      # partner referral flow UUID
 
 # sheet-service
-SHEET_SERVICE = os.environ["SHEET_SERVICE"]
+SHEET_SERVICE = os.environ["SHEET_SERVICE"].rstrip("/")  # tolerate a trailing slash
 SHEET_ID = os.environ["SHEET_ID"]
 FLOW_TAB = os.environ.get("FLOW_TAB", "flow")
 REFERRALS_TAB = os.environ.get("REFERRALS_TAB", "Referrals")
@@ -136,11 +136,20 @@ def _max_iso(a, b):
 
 
 # ---------------------------------------------------------------- sheet writes
-def _sheet_write(body):
+def _sheet_write(body, allow_404=False):
+    """POST to sheet-service /write.
+
+    `allow_404` is for update mode (`newrow:"no"`): sheet-service returns
+    HTTP 404 {"message":"No row found where '<key>' = '<value>'"} when the key
+    is not present — that is a normal 'nothing to update' answer, not an error.
+    Callers use it to decide to append instead.
+    """
     body = dict(body)
     body["password"] = SHEET_PASSWORD
     body["sheetid"] = SHEET_ID
     r = requests.post(f"{SHEET_SERVICE}/write", json=body, timeout=60)
+    if allow_404 and r.status_code == 404:
+        return None
     r.raise_for_status()
     return r.json()
 
@@ -159,8 +168,10 @@ def upsert_flow_row(row):
         "referral_fired": row.get("referral_fired", ""),
         "last_modified": row.get("modified_on", ""),
     }
-    upd = _sheet_write({**data, "newrow": "no"})
-    if upd.get("matched", 0) == 0:
+    # Update in place first. sheet-service answers 404 when the uuid is not on the
+    # tab yet (not an error), and 200 {"matched":N} when it updated.
+    upd = _sheet_write({**data, "newrow": "no"}, allow_404=True)
+    if upd is None or upd.get("matched", 0) == 0:
         _sheet_write({**data, "newrow": "yes"})
         return "inserted"
     return "updated"
