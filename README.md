@@ -1,6 +1,6 @@
 # referral-journey-ingest
 
-Cloud Run service that populates the **`flow`** tab in the External Referral Log
+Cloud Run service that populates the **`Flow`** tab in the External Referral Log
 workbook — the subscriber journey through the outreach flow
 **`Request Call for Support (Yellow)`** (the "yellow", non-crisis referral offer) — and
 **self-heals** missing `Referrals` rows.
@@ -12,7 +12,7 @@ which in-flow sheet writes would miss.
 
 ## What it writes
 
-**`flow` tab** — one row per veteran who reached the referral offer, keyed on `uuid`:
+**`Flow` tab** — one row per veteran who reached the referral offer, keyed on `uuid`:
 
 | Column | Source |
 |---|---|
@@ -40,7 +40,7 @@ failure directly via its own `sheet_log` result — no sheet-diffing required.
 
 ## One-time setup
 
-1. **`flow` tab header row** — create the tab with exactly these headers in row 1:
+1. **`Flow` tab header row** — create the tab with exactly these headers in row 1:
    `uuid | entry_timestamp | provider | response | referral_timestamp | referral_fired | last_modified`
    (sheet-service `newrow:yes` scans the `uuid` key column for the first empty row; the
    header must exist or column mapping fails.)
