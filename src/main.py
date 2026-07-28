@@ -26,9 +26,26 @@ import re
 import time
 import logging
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 import requests
 from flask import Flask, request, jsonify
+
+_ET = ZoneInfo("America/New_York")
+
+
+def _to_et(iso_utc):
+    """UTC ISO ('...Z' or '+00:00') -> ET display string 'YYYY-MM-DD HH:MM'
+    (America/New_York, DST-correct). Blank stays blank. Used only for the
+    human-facing referral_timestamp / Referrals `timestamp` columns — NOT for
+    last_modified/modified_on/created_on, which stay raw UTC for the watermark."""
+    if not iso_utc:
+        return ""
+    try:
+        dt = datetime.fromisoformat(str(iso_utc).replace("Z", "+00:00"))
+    except ValueError:
+        return iso_utc
+    return dt.astimezone(_ET).strftime("%Y-%m-%d %H:%M")
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("referral-journey-ingest")
@@ -290,7 +307,7 @@ def partner_referral(run, submission_key):
     slog = values.get("sheet_log") or {}
     fired = sub.get("category") == "Success"
     logged = slog.get("category") == "Success"
-    ts = sub.get("time", "") if fired else ""
+    ts = _to_et(sub.get("time", "")) if fired else ""
     return ts, fired, logged
 
 
