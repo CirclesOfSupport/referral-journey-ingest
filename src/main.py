@@ -251,7 +251,12 @@ def existing_flow_uuids():
 
 def write_flow_row(row, exists):
     """Write one row: update in place when `exists`, else append. Exactly one
-    sheet-service call — the caller already knows which, from existing_flow_uuids()."""
+    sheet-service call — the caller already knows which, from existing_flow_uuids().
+
+    `nudge` is included ONLY when it is "1"/"2". sheet-service writes each field
+    present in the payload, so including an empty `nudge` would blank a cell that
+    may hold a manually-entered value — omitting the key leaves column H exactly
+    as-is for runs with no recorded nudge (old-flow runs, or no nudge sent)."""
     data = {
         "tab": FLOW_TAB,
         "key": "uuid",
@@ -263,6 +268,8 @@ def write_flow_row(row, exists):
         "referral_fired": row.get("referral_fired", ""),
         "last_modified": row.get("modified_on", ""),
     }
+    if row.get("nudge"):  # "1"/"2" only; blank => key omitted, cell untouched
+        data["nudge"] = row["nudge"]
     if exists:
         # 404 here would mean the row vanished between the read and now; treat as
         # append rather than failing the whole run.
@@ -342,12 +349,20 @@ def yellow_flow_row(run):
     # under `result` on the post-second-nudge terminal wait; a subscriber who
     # replies only after nudge 2 has result_1 blank and the answer in `result`.
     # Coalesce both so late-after-nudge-2 responders are not logged as silent.
+    # nudge count: the consolidated flow increments `nudgecount` each nudge
+    # (result value is a stringified int). Per Logan, surface only an actual
+    # nudge count of 1 or 2 — anything else (0, blank, old-flow runs that never
+    # had the result) leaves the `nudge` cell untouched, matching the column's
+    # prior manual pattern so a rebuild never stamps 0s over blank cells.
+    nudge_raw = (values.get("nudgecount") or {}).get("value", "")
+    nudge = str(nudge_raw).strip() if str(nudge_raw).strip() in ("1", "2") else ""
     resp = _coalesce_yesno(values, ["result_1", "result"])
     return {
         "uuid": (run.get("contact") or {}).get("uuid"),
         "entry_timestamp": run.get("created_on", ""),
         "provider": provider,
         "response": resp,  # "" (blank cell) = no response
+        "nudge": nudge,    # "1"/"2" only; "" leaves the manual cell untouched
         "modified_on": run.get("modified_on", ""),
     }
 

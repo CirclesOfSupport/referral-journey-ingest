@@ -31,6 +31,7 @@ runs, and the YES answer is an ongoing source below.
 | `referral_timestamp` | latest partner run `values.acmf_submission.time` / `values.v4w_submission.time` |
 | `referral_fired` | `yes` if the partner submission `category=Success`; `no` if response was Yes but no successful partner submission; blank otherwise |
 | `last_modified` | outreach flow run `modified_on` — **this column is the watermark source** |
+| `nudge` | consolidated outreach flow `values.nudgecount.value`, written **only** when it is `1` or `2`; any other value (0/blank/old-flow runs without the result) leaves the cell untouched, preserving manually-entered values |
 
 **Scope:** only outreach flow runs where `provider` is set. `provider` is saved on the
 AZ/Other state branches, reachable only down the Veteran path of the usertype split, so
@@ -60,7 +61,7 @@ have a row from the partner referral.
 ## One-time setup
 
 1. **`Flow` tab header row** — create the tab with exactly these headers in row 1:
-   `uuid | entry_timestamp | provider | response | referral_timestamp | referral_fired | last_modified`
+   `uuid | entry_timestamp | provider | response | referral_timestamp | referral_fired | last_modified | nudge`
    (sheet-service `newrow:yes` scans the `uuid` key column for the first empty row; the
    header must exist or column mapping fails.)
 
