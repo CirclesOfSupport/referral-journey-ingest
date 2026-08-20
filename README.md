@@ -2,13 +2,21 @@
 
 Cloud Run service that populates the **`Flow`** tab in the External Referral Log
 workbook — the subscriber journey through the outreach flow
-**`Request Call for Support (Yellow)`** (the "yellow", non-crisis referral offer) — and
-**self-heals** missing `Referrals` rows.
+**`Request Call for Support (Yellow)`** (the "yellow", non-crisis referral offer) —
+**self-heals** missing `Referrals` rows, and fills the **`outreach occured?`** column on
+the `Referrals` tab from the separate **YES follow-up flow**.
 
-It reads the TextIt **runs API** for three flows and writes to Google Sheets via
-`sheet-service`. It does NOT write from inside any TextIt flow — reading runs means a
-late reply that TextIt still associates with the run is captured on the next pull,
-which in-flow sheet writes would miss.
+It reads the TextIt **runs API** for four flows (the outreach flow, the two partner flows,
+and the YES follow-up flow) and writes to Google Sheets via `sheet-service`. It does NOT
+write from inside any TextIt flow — reading runs means a late reply that TextIt still
+associates with the run is captured on the next pull, which in-flow sheet writes would
+miss.
+
+The outreach flow now carries its own nudges internally, and the YES follow-up answer is
+tracked here — so this service is the single logger for the whole referral funnel. Two
+former hand-run one-off back-fills (a disposable nudge-flow back-fill and a YES-flow
+outreach back-fill) are retired: the nudges are read natively from the outreach flow's
+runs, and the YES answer is an ongoing source below.
 
 ## What it writes
 
@@ -19,7 +27,7 @@ which in-flow sheet writes would miss.
 | `uuid` | outreach flow run `contact.uuid` |
 | `entry_timestamp` | outreach flow run `created_on` |
 | `provider` | outreach flow run `values.provider.value` (`ACMF` / `Vets4Warriors`) |
-| `response` | outreach flow run `values."Result 1".category` (`Yes`/`No`/`Other`; **blank = no response**) |
+| `response` | outreach flow run yes/no, coalesced across `values.result_1.category` (in-window / first-nudge wait) and `values.result.category` (post-second-nudge terminal wait); `Yes`/`No`/`Other`; **blank = no response** |
 | `referral_timestamp` | latest partner run `values.acmf_submission.time` / `values.v4w_submission.time` |
 | `referral_fired` | `yes` if the partner submission `category=Success`; `no` if response was Yes but no successful partner submission; blank otherwise |
 | `last_modified` | outreach flow run `modified_on` — **this column is the watermark source** |
@@ -37,6 +45,17 @@ NOT succeed, the in-flow sheet-log write failed at runtime. If no `Referrals` ro
 for that uuid, this service writes the missing row (`uuid`, submission `time`,
 `provider`, `source="self-heal (referral-journey-ingest)"`). The partner run reveals the
 failure directly via its own `sheet_log` result — no sheet-diffing required.
+
+**`Referrals` tab (`outreach occured?` column):** the YES follow-up flow asks referred
+subscribers "did they reach out to you?" a few days later. This service reads that flow's
+runs and writes the `Yes`/`No` answer into the `outreach occured?` column (exact header
+text, lowercase, "occured", trailing "?"), update-in-place keyed on `uuid`, one column
+only. The answer is coalesced across `values.result_2.category` (initial wait) and
+`values.result_3.category` (post-second-nudge terminal wait) — a subscriber who replies
+only after the second nudge has the earlier key blank. `result_1` on the YES flow is a
+different question (a re-offer) and is deliberately NOT read. A `uuid` with no `Referrals`
+row is counted as `outreach_404` and skipped, never appended — a responder should already
+have a row from the partner referral.
 
 ## One-time setup
 
@@ -58,7 +77,7 @@ POST /run     -> incremental (default). Body {} .
 POST /run     -> full rebuild:  body {"rebuild": true}   (ignores watermarks, re-reads all runs)
 ```
 
-`/run` response: `{"status","mode","flow_rows","inserted","updated","self_heals","skipped_no_provider"}`.
+`/run` response: `{"status","mode","flow_rows","inserted","updated","self_heals","skipped_no_provider","outreach_updated","outreach_404","outreach_blank"}`.
 
 ## Config — Cloud Run CONSOLE env vars (NOT cloudbuild.yaml)
 
@@ -70,7 +89,11 @@ The continuous-deploy trigger does not read env, memory, or timeout flags from
 - `SHEET_ID` — the External Referral Log workbook id
 - `SHEET_SERVICE` — sheet-service base URL
 - `FLOW_TAB=Flow` — **must be set**; the tab is `Flow` (capital F) and the code default is lowercase `flow`
-- `YELLOW_FLOW`, `ACMF_FLOW`, `V4W_FLOW` — flow UUIDs
+- `YELLOW_FLOW`, `ACMF_FLOW`, `V4W_FLOW`, `YES_FLOW` — flow UUIDs. `YELLOW_FLOW` is the
+  CONSOLIDATED outreach flow (yellow + nudges in one); `YES_FLOW` is the separate YES
+  follow-up flow.
+- `OUTREACH_COL` — optional; the Referrals-tab column header for the outreach answer
+  (default `outreach occured?`, matching the tab's exact spelling). Only set to override.
 - `PAGE_CEILING=500` — runtime seatbelt on pagination
 - **Request timeout = 3600** (Container tab) — a rebuild pages many runs; 300s default 504s mid-crawl.
 

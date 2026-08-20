@@ -1,19 +1,32 @@
 """
 referral-journey-ingest — Cloud Run service.
 
-Populates the `flow` tab (subscriber journey through the yellow outreach flow)
-and self-heals missing `Referrals` rows, by reading the TextIt runs API for
-three flows: the "yellow" outreach flow Request Call for Support (Yellow)
-(entry/response/provider) and the two partner
-flows (ACMF / V4W) for the actual referral timestamp + fired/logged status.
+Populates the `Flow` tab (subscriber journey through the yellow outreach flow)
+and self-heals missing `Referrals` rows, by reading the TextIt runs API for the
+outreach flow "Request Call for Support (Yellow)" (entry/response/provider) and
+the two partner flows (ACMF / V4W) for the actual referral timestamp +
+fired/logged status.
+
+It ALSO fills the `outreach occured?` column on the `Referrals` tab from the
+separate YES follow-up flow "Request Call for Support (Yellow) YES" — the
+"did they reach out to you?" answer collected a few days after a referral. This
+folds in two former hand-run one-off back-fills: a disposable nudge-flow
+back-fill (now obsolete — the nudges live INSIDE the outreach flow and are read
+natively from its runs) and a YES-flow outreach back-fill (now an ongoing
+tracked source here).
 
 Design notes:
 - The runs API reports each run's FINAL recorded result state, so a late reply
   that TextIt still associates with the run is captured on the next pull. This
   is why the ingest reads runs instead of writing to the sheet from inside the
   flow (in-flow writes would miss late responses).
-- Incremental by run `modified_on` per flow, stored in BigQuery. Full-rebuild
-  available via {"rebuild": true}.
+- Incremental by run `modified_on`, watermarked off the `Flow` tab's
+  `last_modified` column (no state table). Full-rebuild via {"rebuild": true}.
+- A yes/no answer collected across multiple nudge stages lands under DIFFERENT
+  run-result keys (the initial wait vs. the post-second-nudge terminal wait).
+  runs.json reports each run's final state, so both keys can be present; the
+  extractor coalesces them, preferring the final concrete answer. See
+  _coalesce_yesno.
 - TextIt REST limit is 2,500 req/hr; every call goes through _textit_get(),
   which parses the 429 "available in N seconds" body and backs off.
 
@@ -59,15 +72,20 @@ TEXTIT_BASE = "https://textit.com/api/v2"
 TEXTIT_TOKEN = os.environ.get("TEXTIT_TOKEN")  # set in console
 
 # Flow UUIDs
-YELLOW_FLOW = os.environ["YELLOW_FLOW"]  # "Request Call for Support (Yellow)" flow UUID
-ACMF_FLOW = os.environ["ACMF_FLOW"]    # partner referral flow UUID
-V4W_FLOW = os.environ["V4W_FLOW"]      # partner referral flow UUID
+YELLOW_FLOW = os.environ["YELLOW_FLOW"]  # consolidated outreach flow (yellow + nudges)
+ACMF_FLOW = os.environ["ACMF_FLOW"]      # partner referral flow UUID
+V4W_FLOW = os.environ["V4W_FLOW"]        # partner referral flow UUID
+YES_FLOW = os.environ["YES_FLOW"]        # YES follow-up flow ("did they reach out to you?")
 
 # sheet-service
 SHEET_SERVICE = os.environ["SHEET_SERVICE"].rstrip("/")  # tolerate a trailing slash
 SHEET_ID = os.environ["SHEET_ID"]
 FLOW_TAB = os.environ.get("FLOW_TAB", "flow")
 REFERRALS_TAB = os.environ.get("REFERRALS_TAB", "Referrals")
+# EXACT header text on the Referrals tab (lowercase, "occured", trailing "?").
+# sheet-service maps columns by literal header string, so this must match the
+# tab verbatim; overridable in case the header is ever corrected.
+OUTREACH_COL = os.environ.get("OUTREACH_COL", "outreach occured?")
 SHEET_PASSWORD = os.environ.get("SHEET_PASSWORD")  # gappscriptapi value sheet-service checks
 
 # runtime seatbelt
@@ -121,6 +139,35 @@ def iter_runs(flow_uuid, after=None):
         params = None  # next already encodes params
 
 
+# ---------------------------------------------------------------- result helpers
+def _cat(values, key):
+    """`values[key].category` or '' — the Yes/No/Other bucket of a wait result."""
+    return (values.get(key) or {}).get("category", "") or ""
+
+
+def _coalesce_yesno(values, keys):
+    """Coalesce a yes/no answer that may be recorded under any of several result
+    keys, one per nudge stage. runs.json reports each run's FINAL state, so a
+    subscriber who replied only after the second nudge has the EARLIER key blank
+    and the answer under the LATER (terminal) key.
+
+    `keys` is ordered EARLIEST-first (e.g. ["result_1", "result"] for the
+    consolidated outreach flow, ["result_2", "result_3"] for the YES flow). We
+    take a concrete Yes/No from the LATEST stage that has one — that is the
+    subscriber's final recorded answer; if no stage has a Yes/No we keep any
+    non-blank category (e.g. "Other"); blank across all stages = no response.
+    Returns "" for no response.
+    """
+    answer = ""
+    for k in keys:  # earliest -> latest; a later concrete Yes/No wins
+        c = _cat(values, k)
+        if c in ("Yes", "No"):
+            answer = c
+        elif c and answer not in ("Yes", "No"):
+            answer = c  # hold an "Other"/etc. only until a real Yes/No appears
+    return answer
+
+
 # ---------------------------------------------------------------- watermark
 def sheet_watermark():
     """Watermark derived from the sheet itself — max(last_modified) in the Flow tab.
@@ -131,9 +178,11 @@ def sheet_watermark():
     has an old entry time but a fresh modified_on, so they are still picked up.
 
     Returns None when the tab is empty (=> full pull, which is correct on first run).
-    The same value is used as the `after` filter for the partner flows too. That
-    can over-pull them slightly (their runs may have been modified before this
-    point) but never under-pulls, so nothing is missed; the upsert is idempotent.
+    The same value is used as the `after` filter for the partner flows AND the YES
+    flow. That can over-pull them slightly (their runs may have been modified before
+    this point) but never under-pulls, so nothing is missed; every write is an
+    idempotent update-in-place keyed on uuid, so a redundant write just re-stamps
+    the same value.
     """
     r = requests.post(f"{SHEET_SERVICE}/read", json={
         "password": SHEET_PASSWORD,
@@ -164,7 +213,7 @@ def _sheet_write(body, allow_404=False):
     `allow_404` is for update mode (`newrow:"no"`): sheet-service returns
     HTTP 404 {"message":"No row found where '<key>' = '<value>'"} when the key
     is not present — that is a normal 'nothing to update' answer, not an error.
-    Callers use it to decide to append instead.
+    Callers use it to decide to append instead (or to skip).
     """
     body = dict(body)
     body["password"] = SHEET_PASSWORD
@@ -287,15 +336,18 @@ def yellow_flow_row(run):
             provider = "ACMF"
     if not provider:
         return None  # never reached the offer (no provider AND no description)
-    # NOTE: runs.json normalizes result names into snake_case keys — the flow's
-    # "Result 1" is exposed as `result_1` (and e.g. ProviderDescription as
-    # `providerdescription`). Looking up the display name never matches.
-    resp = (values.get("result_1") or {}).get("category", "")  # Yes / No / Other / "" (no response)
+    # runs.json normalizes result names into snake_case keys — the flow's
+    # "Result 1" is exposed as `result_1`. The consolidated flow records the
+    # yes/no answer under `result_1` on the in-window / first-nudge path and
+    # under `result` on the post-second-nudge terminal wait; a subscriber who
+    # replies only after nudge 2 has result_1 blank and the answer in `result`.
+    # Coalesce both so late-after-nudge-2 responders are not logged as silent.
+    resp = _coalesce_yesno(values, ["result_1", "result"])
     return {
         "uuid": (run.get("contact") or {}).get("uuid"),
         "entry_timestamp": run.get("created_on", ""),
         "provider": provider,
-        "response": "" if resp in ("", None) else resp,  # blank cell = no response
+        "response": resp,  # "" (blank cell) = no response
         "modified_on": run.get("modified_on", ""),
     }
 
@@ -329,9 +381,51 @@ def collect_partner(flow_uuid, submission_key, after):
     return latest
 
 
+def collect_yes_outreach(after):
+    """Read the YES follow-up flow's runs; return {uuid: "Yes"|"No"|"Other"|""} —
+    the "did they reach out to you?" answer, latest run per uuid (max modified_on).
+
+    The YES flow asks the same yes/no across nudge stages, so the answer lands
+    under `result_2` (initial wait) or `result_3` (post-second-nudge terminal
+    wait). `result_1` on this flow is a DIFFERENT question (a re-offer that
+    routes elsewhere) and is NOT the outreach answer — do not read it here.
+    The caller writes only concrete Yes/No; blank/Other is counted and skipped.
+    """
+    latest = {}  # uuid -> (answer, modified_on)
+    for run in iter_runs(YES_FLOW, after=after):
+        uuid = (run.get("contact") or {}).get("uuid")
+        if not uuid:
+            continue
+        values = run.get("values") or {}
+        answer = _coalesce_yesno(values, ["result_2", "result_3"])
+        mod = run.get("modified_on", "")
+        prev = latest.get(uuid)
+        if prev is None or mod >= prev[1]:
+            latest[uuid] = (answer, mod)
+    return {u: a for u, (a, _) in latest.items()}
+
+
+def write_outreach_occured(uuid, answer):
+    """Update the `outreach occured?` column on the Referrals tab in place, keyed
+    on uuid. Only this one column is written (partial update). Returns "updated",
+    "skipped_404" (no Referrals row for this uuid — a YES-flow responder should
+    already have one from the partner POST, so a 404 is a signal, not an append),
+    or "noop"."""
+    res = _sheet_write({
+        "tab": REFERRALS_TAB,
+        "newrow": "no",
+        "key": "uuid",
+        "uuid": uuid,
+        OUTREACH_COL: answer,
+    }, allow_404=True)
+    if res is None:
+        return "skipped_404"
+    return "updated" if res.get("matched", 0) > 0 else "noop"
+
+
 def run_ingest(rebuild=False):
     # Single watermark derived from the Flow tab (max last_modified). Used for all
-    # three flows; None on a rebuild or an empty tab => full pull.
+    # flows; None on a rebuild or an empty tab => full pull.
     after = None if rebuild else sheet_watermark()
 
     # 1) partner runs first — build the referral lookup used to enrich journey rows
@@ -350,7 +444,9 @@ def run_ingest(rebuild=False):
     # One read of the tab, so each row costs exactly one write (Sheets API allows
     # only 60 reads/min/user and sheet-service reads the header on every write).
     existing = existing_flow_uuids()
-    stats = {"flow_rows": 0, "inserted": 0, "updated": 0, "self_heals": 0, "skipped_no_provider": 0}
+    stats = {"flow_rows": 0, "inserted": 0, "updated": 0, "self_heals": 0,
+             "skipped_no_provider": 0, "outreach_updated": 0, "outreach_404": 0,
+             "outreach_blank": 0}
     for run in iter_runs(YELLOW_FLOW, after=after):
         row = yellow_flow_row(run)
         if row is None:
@@ -378,6 +474,22 @@ def run_ingest(rebuild=False):
             if uuid not in referral_uuids:
                 heal_referral_row(uuid, rec["ts"], rec["provider"])
                 stats["self_heals"] += 1
+
+    # 4) YES follow-up flow -> `outreach occured?` on the Referrals tab.
+    #    Update-in-place on the one column, keyed on uuid. A responder should
+    #    already have a Referrals row (from the partner POST); a 404 means none
+    #    exists and is surfaced as a count, not silently appended.
+    yes = collect_yes_outreach(after)
+    for uuid, answer in yes.items():
+        if answer not in ("Yes", "No"):
+            stats["outreach_blank"] += 1
+            continue
+        outcome = write_outreach_occured(uuid, answer)
+        time.sleep(WRITE_PACE_SEC)
+        if outcome == "updated":
+            stats["outreach_updated"] += 1
+        elif outcome == "skipped_404":
+            stats["outreach_404"] += 1
 
     return stats
 
