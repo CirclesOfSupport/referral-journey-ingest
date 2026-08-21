@@ -141,8 +141,15 @@ def iter_runs(flow_uuid, after=None):
 
 # ---------------------------------------------------------------- result helpers
 def _cat(values, key):
-    """`values[key].category` or '' — the Yes/No/Other bucket of a wait result."""
-    return (values.get(key) or {}).get("category", "") or ""
+    """`values[key].category` or '' — the Yes/No/Other bucket of a wait result.
+
+    The consolidated outreach flow and the YES flow both name their wait-timeout
+    branch with the literal category "No Response". That is a non-answer (the
+    old separate flow left the category blank on timeout), so it is normalized to
+    '' here — the Flow-tab `response` column is Yes / No / Other / blank, and a
+    timeout must read as blank, never the text "No Response"."""
+    c = (values.get(key) or {}).get("category", "") or ""
+    return "" if c == "No Response" else c
 
 
 def _coalesce_yesno(values, keys):
