@@ -58,6 +58,43 @@ different question (a re-offer) and is deliberately NOT read. A `uuid` with no `
 row is counted as `outreach_404` and skipped, never appended — a responder should already
 have a row from the partner referral.
 
+## Testimonial log (separate program, separate workbook)
+
+This service also carries a **self-contained testimonial-log module**: a distinct program
+(video testimonials collected via Senja) that reuses the same runs-API-not-in-flow-writes
+plumbing but is otherwise independent — its own flow, its own workbook, its own read and
+write. It is written as a lift-out module and is expected to graduate to its own
+`testimonial-log` service as the testimonial ask scales; nothing in the referral funnel
+depends on it, and it is a no-op unless configured.
+
+It reads the **Video Testimonial Request** flow's runs and upserts a 4-column tab in its
+own workbook, keyed on `uuid`:
+
+| Column | Source |
+|---|---|
+| `uuid` | run `contact.uuid` (every run == a testimonial ask was sent) |
+| `timestamp` | run `created_on` (when the ask went out) |
+| `Response` | `values.result.category` — `Yes`/`No`/`Other`; **blank = never answered** |
+| `Response timestamp` | `values.result.time` — when that answer was set (the reply moment); blank if unanswered |
+
+The flow has a single wait node (result name `Result`, runs key `result`). Its "Other"
+branch reprompts and loops back into the **same** wait node, so a subscriber who first
+sends something unparseable and then replies Yes/No overwrites the result in place;
+`runs.json` reports only the final state, so the last answer is what lands — no special
+handling needed.
+
+**No watermark:** the pilot cohort is tiny, so every run is a full pull each time. This is
+what guarantees a late answer (Other→loop, or a delayed reply) lands. Idempotent
+uuid-keyed upsert, so re-stamping an unchanged row is inert.
+
+**Endpoints:** the testimonial pass runs at the end of `/run` (stats merge in under
+`testimonial_*` keys), and also has its own `POST /run-testimonial` for running it alone.
+When `TESTIMONIAL_FLOW`/`TESTIMONIAL_SHEET_ID` are unset, both are no-ops (the dedicated
+endpoint returns 400).
+
+**One-time setup:** create the testimonial tab with exactly these headers in row 1:
+`uuid | timestamp | Response | Response timestamp`.
+
 ## One-time setup
 
 1. **`Flow` tab header row** — create the tab with exactly these headers in row 1:
@@ -78,7 +115,9 @@ POST /run     -> incremental (default). Body {} .
 POST /run     -> full rebuild:  body {"rebuild": true}   (ignores watermarks, re-reads all runs)
 ```
 
-`/run` response: `{"status","mode","flow_rows","inserted","updated","self_heals","skipped_no_provider","outreach_updated","outreach_404","outreach_blank"}`.
+`/run` response: `{"status","mode","flow_rows","inserted","updated","self_heals","skipped_no_provider","outreach_updated","outreach_404","outreach_blank"}`, plus `testimonial_rows`/`testimonial_inserted`/`testimonial_updated` when the testimonial module is configured (see below).
+
+`POST /run-testimonial` — the testimonial log only (referral funnel untouched); returns `{"status","testimonial_rows","testimonial_inserted","testimonial_updated"}`, or 400 if the testimonial vars are unset.
 
 ## Config — Cloud Run CONSOLE env vars (NOT cloudbuild.yaml)
 
@@ -97,6 +136,13 @@ The continuous-deploy trigger does not read env, memory, or timeout flags from
   (default `outreach occured?`, matching the tab's exact spelling). Only set to override.
 - `PAGE_CEILING=500` — runtime seatbelt on pagination
 - **Request timeout = 3600** (Container tab) — a rebuild pages many runs; 300s default 504s mid-crawl.
+
+Testimonial-log module (all optional — unset = the testimonial pass is skipped, referral
+funnel unaffected):
+
+- `TESTIMONIAL_FLOW` — Video Testimonial Request flow UUID
+- `TESTIMONIAL_SHEET_ID` — the testimonial workbook id (a DIFFERENT workbook from `SHEET_ID`)
+- `TESTIMONIAL_TAB` — the testimonial tab name (default `Sheet1`; set to the actual tab)
 
 ## Rate limit
 

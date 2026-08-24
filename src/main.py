@@ -88,6 +88,19 @@ REFERRALS_TAB = os.environ.get("REFERRALS_TAB", "Referrals")
 OUTREACH_COL = os.environ.get("OUTREACH_COL", "outreach occured?")
 SHEET_PASSWORD = os.environ.get("SHEET_PASSWORD")  # gappscriptapi value sheet-service checks
 
+# ---- testimonial log (SEPARATE concern, SEPARATE workbook) ----
+# The video-testimonial yes/no log is a distinct program (Senja video testimonials,
+# Dina's 2026-08-11 ask) that happens to reuse the same runs-API plumbing. It lives
+# in a DIFFERENT workbook from the referral log and is written as a self-contained
+# module so it lifts out into its own `testimonial-log` service later without a
+# rewrite (the testimonial log is a distinct program tracked to graduate to its
+# own service). All three vars are optional so the referral service
+# runs unchanged if the testimonial log is not configured; when TESTIMONIAL_FLOW
+# is unset, the testimonial pass is skipped entirely.
+TESTIMONIAL_FLOW = os.environ.get("TESTIMONIAL_FLOW")        # Video Testimonial Request flow UUID
+TESTIMONIAL_SHEET_ID = os.environ.get("TESTIMONIAL_SHEET_ID")  # its own workbook (NOT SHEET_ID)
+TESTIMONIAL_TAB = os.environ.get("TESTIMONIAL_TAB", "Sheet1")  # tab name; set to the actual tab
+
 # runtime seatbelt
 PAGE_CEILING = int(os.environ.get("PAGE_CEILING", "500"))
 # Google Sheets API allows 60 read requests/min/user, and sheet-service reads the
@@ -445,6 +458,142 @@ def write_outreach_occured(uuid, answer):
     return "updated" if res.get("matched", 0) > 0 else "noop"
 
 
+# ================================================================ TESTIMONIAL LOG
+# Self-contained module — its own workbook (TESTIMONIAL_SHEET_ID), its own read,
+# its own row builder, its own write. Deliberately does NOT reuse the referral
+# sheet helpers above, because those are hardwired to SHEET_ID (the referral
+# workbook). Keeping this block credential-and-workbook-isolated is what lets it
+# be moved to a standalone `testimonial-log` service by copying this section plus
+# the TESTIMONIAL_* env vars — nothing else in the file depends on it.
+#
+# Flow shape (verified against the flow JSON 2026-08-24): a single Wait for
+# Response node, result name "Result" (runs.json key `result`). The "Other" branch
+# reprompts and loops BACK INTO THE SAME wait node, so a subscriber who first says
+# something unparseable and then replies Yes/No overwrites `result` in place.
+# runs.json reports only the run's FINAL result state, so the last answer is the
+# one read — the "Other gets overtaken by a later Yes/No" requirement needs no
+# special handling; there is exactly one result key, not the yellow flow's
+# result_1/result split.
+#
+# `TESTIMONIAL_TESTIMONIAL_*` columns written (4-col tab):
+#   uuid                -> run contact.uuid           (every run == a message was sent)
+#   timestamp           -> run created_on             (raw UTC ISO; when the ask went out)
+#   Response            -> values.result.category     (Yes/No/Other; blank = never answered)
+#   Response timestamp  -> values.result.time         (when that result was set == the reply moment; blank if unanswered)
+
+def _testimonial_write(body, allow_404=False):
+    """POST to sheet-service /write against the TESTIMONIAL workbook. Mirror of
+    _sheet_write but bound to TESTIMONIAL_SHEET_ID — kept separate so the
+    testimonial module has no dependency on the referral SHEET_ID."""
+    body = dict(body)
+    body["password"] = SHEET_PASSWORD
+    body["sheetid"] = TESTIMONIAL_SHEET_ID
+    r = requests.post(f"{SHEET_SERVICE}/write", json=body, timeout=60)
+    if allow_404 and r.status_code == 404:
+        return None
+    r.raise_for_status()
+    return r.json()
+
+
+def existing_testimonial_uuids():
+    """One read of the testimonial tab -> {uuid: True}. Same 60-read/min-quota
+    reasoning as existing_flow_uuids(): read once, decide insert-vs-update locally,
+    one write per row."""
+    r = requests.post(f"{SHEET_SERVICE}/read", json={
+        "password": SHEET_PASSWORD,
+        "sheetid": TESTIMONIAL_SHEET_ID,
+        "tab": TESTIMONIAL_TAB,
+        "mode": "all",
+        "columns": ["uuid"],
+    }, timeout=60)
+    r.raise_for_status()
+    rows = r.json().get("rows") or []
+    return {str(x.get("uuid") or "").strip(): True
+            for x in rows if str(x.get("uuid") or "").strip()}
+
+
+def testimonial_row(run):
+    """Build the 4-column testimonial row from a run. Every run of the flow is a
+    sent message, so every run produces a row (no scope filter like the yellow
+    flow's provider-presence). `result` is the single wait-node result; its
+    `category` is the final Yes/No/Other and its `time` is when that answer was
+    set. Blank category/time = the subscriber never replied."""
+    values = run.get("values") or {}
+    result = values.get("result") or {}
+    category = result.get("category", "") or ""
+    # "No Response" is TextIt's wait-timeout category on some flows; normalize any
+    # such non-answer to blank so the Response column reads Yes/No/Other/blank.
+    if category == "No Response":
+        category = ""
+    # This flow's category names are uppercase (YES/NO/Other); title-case so the
+    # column matches the referral log's Yes/No convention. "" stays "".
+    if category:
+        category = category.title()
+    resp_time = result.get("time", "") or "" if category else ""
+    return {
+        "uuid": (run.get("contact") or {}).get("uuid"),
+        "timestamp": run.get("created_on", ""),
+        "Response": category,
+        "Response timestamp": resp_time,
+    }
+
+
+def write_testimonial_row(row, exists):
+    """Write one testimonial row: update in place when `exists`, else append.
+    Exactly one sheet-service call (the caller knows which from
+    existing_testimonial_uuids()). All four columns are always written — unlike
+    the Flow tab's conditional `nudge`, none of these columns is ever
+    hand-maintained, so a blank is authoritative (means 'no response yet')."""
+    data = {
+        "tab": TESTIMONIAL_TAB,
+        "key": "uuid",
+        "uuid": row["uuid"],
+        "timestamp": row.get("timestamp", ""),
+        "Response": row.get("Response", ""),
+        "Response timestamp": row.get("Response timestamp", ""),
+    }
+    if exists:
+        res = _testimonial_write({**data, "newrow": "no"}, allow_404=True)
+        if res is not None and res.get("matched", 0) > 0:
+            return "updated"
+        _testimonial_write({**data, "newrow": "yes"})
+        return "inserted"
+    _testimonial_write({**data, "newrow": "yes"})
+    return "inserted"
+
+
+def run_testimonial():
+    """Read the testimonial flow's runs and upsert the 4-column log.
+
+    No watermark: the testimonial tab has no last_modified column and the pilot
+    cohort is tiny (n≈35), so every run is a full pull keyed on uuid. Because a
+    subscriber's answer can arrive late (Other→loop, or a delayed reply), a full
+    pull each time is what guarantees the final answer lands — the same
+    late-response property the referral service gets from its watermark, achieved
+    here by simply re-reading all runs. Idempotent uuid-keyed upsert, so
+    re-stamping an unchanged row is inert.
+
+    Returns {} (a no-op) when TESTIMONIAL_FLOW is unconfigured, so the referral
+    service is unaffected if the testimonial log is not deployed here.
+    """
+    if not (TESTIMONIAL_FLOW and TESTIMONIAL_SHEET_ID):
+        return {}
+    existing = existing_testimonial_uuids()
+    stats = {"testimonial_rows": 0, "testimonial_inserted": 0, "testimonial_updated": 0}
+    for run in iter_runs(TESTIMONIAL_FLOW):  # no `after` — full pull, tiny cohort
+        row = testimonial_row(run)
+        if not row["uuid"]:
+            continue
+        result = write_testimonial_row(row, row["uuid"] in existing)
+        time.sleep(WRITE_PACE_SEC)
+        stats["testimonial_rows"] += 1
+        stats["testimonial_" + result] += 1
+    return stats
+
+
+# ================================================================================
+
+
 def run_ingest(rebuild=False):
     # Single watermark derived from the Flow tab (max last_modified). Used for all
     # flows; None on a rebuild or an empty tab => full pull.
@@ -513,12 +662,38 @@ def run_ingest(rebuild=False):
         elif outcome == "skipped_404":
             stats["outreach_404"] += 1
 
+    # 5) testimonial log — SEPARATE workbook, no-op unless configured. Runs after
+    #    the referral funnel; its stats merge in under testimonial_* keys. A
+    #    failure here would surface as a 500 like any other step; the testimonial
+    #    write set is tiny so this is acceptable for the pilot. When it graduates
+    #    to its own service, delete this call and the module above.
+    stats.update(run_testimonial())
+
     return stats
 
 
 @app.route("/health")
 def health():
     return jsonify({"status": "ok"})
+
+
+@app.route("/run-testimonial", methods=["POST"])
+def run_testimonial_endpoint():
+    """Testimonial log only — the referral funnel is untouched. Exists so the
+    testimonial pass can be scheduled/run on its own cadence, and so it lifts out
+    cleanly when it graduates to a standalone service (this endpoint becomes that
+    service's `/run`)."""
+    started = datetime.now(timezone.utc).isoformat()
+    if not (TESTIMONIAL_FLOW and TESTIMONIAL_SHEET_ID):
+        return jsonify({"status": "error",
+                        "error": "TESTIMONIAL_FLOW / TESTIMONIAL_SHEET_ID not configured",
+                        "started": started}), 400
+    try:
+        stats = run_testimonial()
+    except Exception as e:
+        log.exception("testimonial ingest failed")
+        return jsonify({"status": "error", "error": str(e), "started": started}), 500
+    return jsonify({"status": "ok", "started": started, **stats})
 
 
 @app.route("/run", methods=["POST"])
