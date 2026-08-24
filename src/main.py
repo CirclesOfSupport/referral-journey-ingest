@@ -477,9 +477,9 @@ def write_outreach_occured(uuid, answer):
 #
 # `TESTIMONIAL_TESTIMONIAL_*` columns written (4-col tab):
 #   uuid                -> run contact.uuid           (every run == a message was sent)
-#   timestamp           -> run created_on             (raw UTC ISO; when the ask went out)
+#   timestamp           -> _to_et(run created_on)     (ET display 'YYYY-MM-DD HH:MM'; when the ask went out)
 #   Response            -> values.result.category     (Yes/No/Other; blank = never answered)
-#   Response timestamp  -> values.result.time         (when that result was set == the reply moment; blank if unanswered)
+#   Response timestamp  -> _to_et(values.result.time) (ET display; when that result was set == the reply moment; blank if unanswered)
 
 def _testimonial_write(body, allow_404=False):
     """POST to sheet-service /write against the TESTIMONIAL workbook. Mirror of
@@ -532,9 +532,9 @@ def testimonial_row(run):
     resp_time = result.get("time", "") or "" if category else ""
     return {
         "uuid": (run.get("contact") or {}).get("uuid"),
-        "timestamp": run.get("created_on", ""),
+        "timestamp": _to_et(run.get("created_on", "")),
         "Response": category,
-        "Response timestamp": resp_time,
+        "Response timestamp": _to_et(resp_time),
     }
 
 
