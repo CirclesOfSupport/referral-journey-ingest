@@ -109,16 +109,46 @@ PAGE_CEILING = int(os.environ.get("PAGE_CEILING", "500"))
 # and unaffected in practice.
 WRITE_PACE_SEC = float(os.environ.get("WRITE_PACE_SEC", "1.1"))
 
+# TextIt transient-error retry (5xx + connection/read timeouts). Bounded, unlike
+# the 429 rate-limit loop: a persistent 5xx is a real outage to surface, not spin
+# on. Backoff is exponential: base, 2*base, 4*base, ... 5 retries at base=5s
+# spans ~5+10+20+40+80 = 155s of retrying before giving up.
+TEXTIT_MAX_RETRIES = int(os.environ.get("TEXTIT_MAX_RETRIES", "5"))
+TEXTIT_BACKOFF_BASE = float(os.environ.get("TEXTIT_BACKOFF_BASE", "5"))
+
 
 # ---------------------------------------------------------------- TextIt reads
 def _textit_get(url, params=None):
-    """GET with the 2,500/hr rate limit handled: parse the 429 'available in N'
-    body and sleep N+3, retry. Never dies on a throttle."""
+    """GET with TextIt's transient failures handled:
+      - 429 (rate limit): parse the 'available in N seconds' body and sleep N+3,
+        retry indefinitely. A throttle is not an error — never dies on it.
+      - 5xx (transient TextIt-side error) and connection/read timeouts: retry a
+        BOUNDED number of times with exponential backoff, then give up and raise.
+        A single upstream 500 on one runs.json page previously killed the whole
+        nightly ingest (2026-08-25: the V4W flow's runs endpoint 500'd, the
+        pipeline HALTed the chain). 5xx retries are bounded (unlike 429) because
+        a persistent 5xx is a real outage we should surface, not spin on.
+
+    Rate-limit sleeps do NOT count against the 5xx retry budget."""
     headers = {"Authorization": f"Token {TEXTIT_TOKEN}"}
-    attempt = 0
+    attempt = 0          # total loop iterations (for logging)
+    err_retries = 0      # bounded 5xx / connection-error retries consumed
     while True:
         attempt += 1
-        r = requests.get(url, headers=headers, params=params, timeout=60)
+        try:
+            r = requests.get(url, headers=headers, params=params, timeout=60)
+        except (requests.ConnectionError, requests.Timeout) as e:
+            if err_retries >= TEXTIT_MAX_RETRIES:
+                log.error("textit connection error, retries exhausted (%s): %s",
+                          err_retries, e)
+                raise
+            err_retries += 1
+            wait = TEXTIT_BACKOFF_BASE * (2 ** (err_retries - 1))
+            log.warning("textit connection error; sleeping %ss (retry %s/%s): %s",
+                        wait, err_retries, TEXTIT_MAX_RETRIES, e)
+            time.sleep(wait)
+            continue
+
         if r.status_code == 429:
             wait = 60
             m = re.search(r"available in (\d+)", r.text)
@@ -127,6 +157,19 @@ def _textit_get(url, params=None):
             log.warning("textit 429; sleeping %ss (attempt %s)", wait, attempt)
             time.sleep(wait)
             continue
+
+        if r.status_code >= 500:
+            if err_retries >= TEXTIT_MAX_RETRIES:
+                log.error("textit %s, retries exhausted (%s) for %s",
+                          r.status_code, err_retries, r.url)
+                r.raise_for_status()
+            err_retries += 1
+            wait = TEXTIT_BACKOFF_BASE * (2 ** (err_retries - 1))
+            log.warning("textit %s; sleeping %ss (retry %s/%s) for %s",
+                        r.status_code, wait, err_retries, TEXTIT_MAX_RETRIES, r.url)
+            time.sleep(wait)
+            continue
+
         r.raise_for_status()
         return r.json()
 
