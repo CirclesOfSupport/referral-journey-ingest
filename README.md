@@ -104,7 +104,7 @@ Sibling module to the testimonial log — own reads, own write, lifts out with i
 | Column | Header (exact) | Source |
 |---|---|---|
 | F | `Survey Response (Survey Field)` | the option router's final `category` — the label TEXT ("Busy", not "2"), since the numbers map to different content in each flow |
-| G | `Open-Ended Response (Concat: Other + Free Text)` | the contact's incoming messages on that flow, chronological, joined ` \| ` |
+| G | `Open-Ended Response (Concat: Other + Free Text)` | "other plus free text" — the contact's unparseable `Other` replies plus the `Something Else` elaboration, chronological, joined ` \| ` |
 
 **Targets resolve by HEADER NAME, never by column letter.** A hand-maintained
 `Test #2 Sent? ` column sits at E (note the trailing space in that header). Writing by
@@ -130,10 +130,21 @@ runs.json carries no message text (`path` is node + time only). That original te
 the log is meant to keep, so G is built from the messages endpoint. Note the endpoint has no
 `flow` query param: it is filtered by `contact` and scoped to the flow client-side.
 
-The messages call is made for every run that got a reply. It is **not** skipped when F looks
-like a clean numbered choice, because an overwritten `Other` is indistinguishable from a
-first-try clean answer in runs.json — skipping there would drop exactly the text being
-preserved. The only skip is `responded == False`, where the contact sent nothing at all.
+**G holds ONLY unstructured content — never menu digits.** A contact who picked a valid
+option on the first try has nothing unstructured to record, so G is correctly BLANK; their
+answer is fully represented by F's label. Echoing the digit into G would duplicate F and, since
+the two flows map the same digit to different labels, would be actively misleading.
+
+Scoping is by TIME, not by inspecting text. Every failed `Other` attempt arrives strictly
+BEFORE the moment the final option result was set, so messages at/after that instant (the valid
+selection) are excluded. When the final category is itself `Other` the contact never landed a
+valid selection, so nothing parsed and every incoming message qualifies — including the last,
+whose timestamp equals the result time.
+
+An `Other` is detected from the run's `path`: the loop-back overwrites the result, so `values`
+cannot reveal that it happened, but the reprompt node's presence in the path is definitive.
+The messages endpoint is therefore consulted ONLY for runs that actually hit `Other` — the
+common first-try-clean case costs no request at all.
 
 The override applies to `Other` only. `Something Else` (the last numbered option) routes to
 the free-text catcher and terminates, with no path back to the router.

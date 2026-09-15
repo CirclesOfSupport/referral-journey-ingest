@@ -113,12 +113,18 @@ TESTIMONIAL_TAB = os.environ.get("TESTIMONIAL_TAB", "Sheet1")  # tab name; set t
 SURVEY_YES_FLOW = os.environ.get("SURVEY_YES_FLOW")    # "...Request - YES"
 SURVEY_NONR_FLOW = os.environ.get("SURVEY_NONR_FLOW")  # "...Request - NO and NR"
 
-# (flow_uuid_env_value, option_result_key, freetext_result_key)
-# option key  -> the numbered-choice router; its `category` is the label for F.
-# freetext key-> the "Something Else" elaboration catcher (All Responses).
+# (flow_uuid_env_value, option_result_key, freetext_result_key, other_node_uuid)
+# option key   -> the numbered-choice router; its `category` is the label for F.
+# freetext key -> the "Something Else" elaboration catcher (All Responses).
+# other_node   -> the "humble chatbot" reprompt node on the `Other` branch. Its
+#                 presence in a run's `path` is the ONLY reliable evidence that an
+#                 unparseable reply happened, because the loop-back overwrites the
+#                 result and erases it from `values`.
 SURVEY_FLOWS = [
-    (SURVEY_YES_FLOW, "result", "result_3"),
-    (SURVEY_NONR_FLOW, "result_4", "result_5"),
+    (SURVEY_YES_FLOW, "result", "result_3",
+     "59fe4410-41f1-4a73-95e5-6afa3f08ccce"),
+    (SURVEY_NONR_FLOW, "result_4", "result_5",
+     "2414fb1c-9823-4bb3-86fb-6d79f45578df"),
 ]
 
 SURVEY_RESPONSE_COL = "Survey Response (Survey Field)"
@@ -721,65 +727,85 @@ def iter_contact_messages(contact_uuid):
         params = None  # next already encodes params
 
 
-def survey_freetext(contact_uuid, flow_uuid):
-    """Concatenate a contact's INCOMING messages on one flow, oldest-first.
+def survey_other_texts(contact_uuid, flow_uuid, before_iso):
+    """The contact's UNPARSEABLE (`Other`) replies on one flow, oldest-first.
 
-    messages.json sorts created_on DESC (newest first), so results are reversed to
-    restore conversational order. Scoped to `direction == incoming` (outgoing are
-    our own prompts) and to this flow, so a contact's traffic on other EA flows
-    never leaks into the cell. Deduplicates consecutive identical texts and skips
-    blanks. Returns '' when the contact sent nothing on this flow."""
+    Scoped by TIME, not by guessing at content. The `Other` branch reprompts and
+    loops back into the same option router, so every failed attempt arrives
+    STRICTLY BEFORE the moment the final option result was set. The message that
+    set that final result is the valid selection and is excluded — it is already
+    represented in column F as a label, and echoing its menu digit into G is
+    noise.
+
+    `before_iso` is the final option result's `time`. With no such time (the run
+    never reached a decided result) every incoming message on the flow qualifies,
+    since none of them parsed.
+
+    Only called when the run's `path` proves an `Other` actually occurred, so the
+    common first-try-clean case costs no messages request at all."""
     texts = []
     for msg in iter_contact_messages(contact_uuid):
         if (msg.get("direction") or "").lower() not in ("incoming", "in"):
             continue
         if ((msg.get("flow") or {}).get("uuid")) != flow_uuid:
             continue
+        created = msg.get("created_on") or ""
+        if before_iso and created >= before_iso:
+            continue  # the valid selection (or anything after it)
         t = (msg.get("text") or "").strip()
         if t:
-            texts.append((msg.get("created_on") or "", t))
+            texts.append((created, t))
     texts.sort(key=lambda x: x[0])  # oldest-first; API returns newest-first
     out = []
     for _, t in texts:
         if not out or out[-1] != t:
             out.append(t)
-    return SURVEY_CONCAT_SEP.join(out)
+    return out
 
 
-def survey_row(run, option_key, freetext_key, flow_uuid):
+def survey_row(run, option_key, freetext_key, flow_uuid, other_node):
     """Build {uuid, F, G} for one survey run.
 
     F: the option router's final category. A wait-timeout ("No Response") is
-    normalized to blank by _cat, so F reads as a real label or blank, never the
-    literal words "No Response".
+    normalized to blank by _cat, so F reads as a real label or blank.
 
-    G: the contact's incoming free text on this flow.
+    G: "other plus free text" — the two UNSTRUCTURED sources the DM asked for, and
+    nothing else:
+      1. the contact's unparseable `Other` replies, and
+      2. the `Something Else` elaboration captured by the free-text catcher.
+    A contact who picked a valid option first try has NO unstructured content, so
+    G is correctly blank — their answer is fully represented by F's label. Menu
+    digits are never carried into G; F already encodes that choice, and the two
+    flows map the same digit to different labels anyway.
 
-    The messages endpoint is consulted for EVERY run that got a reply. It is
-    tempting to skip it when F holds a clean numbered label and no free-text
-    result exists — but that is precisely the case that must NOT be skipped: an
-    `Other` that was later overwritten by a valid choice looks IDENTICAL in
-    runs.json to a first-try clean answer, because the overwrite is what destroys
-    the evidence. Skipping there would silently drop the original text the DM
-    asked to keep. There is no reliable signal in `values` to tell the two apart,
-    so the only correct read is to ask the messages endpoint.
-
-    The one safe skip is `responded == False`: TextIt sets it when the contact
-    sent nothing at all on the run, so there is no incoming message to find and G
-    is necessarily blank."""
+    An `Other` is detected from the run's `path`: the loop-back overwrites the
+    result, so `values` cannot show that it happened, but the reprompt node's
+    presence in the path is definitive. Messages are fetched only in that case."""
     values = run.get("values") or {}
     contact_uuid = (run.get("contact") or {}).get("uuid")
     category = _cat(values, option_key)
 
-    responded = run.get("responded")
-    freetext = ""
-    if contact_uuid and responded is not False:
-        freetext = survey_freetext(contact_uuid, flow_uuid)
+    parts = []
+    hit_other = any((step or {}).get("node") == other_node
+                    for step in (run.get("path") or []))
+    if contact_uuid and hit_other and run.get("responded") is not False:
+        # When the FINAL category is itself `Other`, the contact never landed a
+        # valid selection, so nothing they sent parsed and every incoming message
+        # is unstructured — including the last one, whose timestamp IS the result
+        # time. Cutting strictly before that time would drop it. Otherwise the
+        # final result was set by a valid selection, which is excluded.
+        result_time = ("" if category == "Other"
+                       else (values.get(option_key) or {}).get("time", "") or "")
+        parts.extend(survey_other_texts(contact_uuid, flow_uuid, result_time))
+
+    elaboration = ((values.get(freetext_key) or {}).get("value", "") or "").strip()
+    if elaboration and (not parts or parts[-1] != elaboration):
+        parts.append(elaboration)
 
     return {
         "uuid": contact_uuid,
         SURVEY_RESPONSE_COL: category,
-        SURVEY_FREETEXT_COL: freetext,
+        SURVEY_FREETEXT_COL: SURVEY_CONCAT_SEP.join(parts),
     }
 
 
@@ -815,13 +841,13 @@ def run_survey():
     Returns {} when neither survey flow is configured, so the rest of the service
     is unaffected if this is not deployed.
     """
-    configured = [(f, o, x) for (f, o, x) in SURVEY_FLOWS if f]
+    configured = [(f, o, x, n) for (f, o, x, n) in SURVEY_FLOWS if f]
     if not configured or not TESTIMONIAL_SHEET_ID:
         return {}
     stats = {"survey_rows": 0, "survey_updated": 0, "survey_unmatched": 0}
-    for flow_uuid, option_key, freetext_key in configured:
+    for flow_uuid, option_key, freetext_key, other_node in configured:
         for run in iter_runs(flow_uuid):  # no `after` — full pull, tiny cohort
-            row = survey_row(run, option_key, freetext_key, flow_uuid)
+            row = survey_row(run, option_key, freetext_key, flow_uuid, other_node)
             if not row["uuid"]:
                 continue
             outcome = write_survey_row(row)
