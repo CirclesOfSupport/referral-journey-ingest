@@ -727,22 +727,26 @@ def iter_contact_messages(contact_uuid):
         params = None  # next already encodes params
 
 
-def survey_other_texts(contact_uuid, flow_uuid, before_iso):
+def survey_other_texts(contact_uuid, flow_uuid, before_iso, selection_text=""):
     """The contact's UNPARSEABLE (`Other`) replies on one flow, oldest-first.
 
-    Scoped by TIME, not by guessing at content. The `Other` branch reprompts and
-    loops back into the same option router, so every failed attempt arrives
-    STRICTLY BEFORE the moment the final option result was set. The message that
-    set that final result is the valid selection and is excluded — it is already
-    represented in column F as a label, and echoing its menu digit into G is
-    noise.
+    Two filters, because either alone leaks:
 
-    `before_iso` is the final option result's `time`. With no such time (the run
-    never reached a decided result) every incoming message on the flow qualifies,
-    since none of them parsed.
+    1. TIME. The `Other` branch reprompts and loops back into the same option
+       router, so every failed attempt arrives before the moment the final option
+       result was set.
 
-    Only called when the run's `path` proves an `Other` actually occurred, so the
-    common first-try-clean case costs no messages request at all."""
+    2. THE SELECTION TEXT ITSELF. A message's `created_on` is stamped when TextIt
+       RECEIVES it, while the result's `time` is stamped when the flow PROCESSES
+       it — a fraction of a second later. So the valid selection is genuinely
+       "before" the result time and slips past filter 1. Dropping messages whose
+       text equals the raw value that set the result removes it deterministically.
+       Observed live: a contact sent "4,3" (unparseable -> Other), then "4"; the
+       time filter alone left G as "4,3 | 4" instead of "4,3".
+
+    `before_iso` empty means the final category was itself `Other` — nothing the
+    contact sent ever parsed, so every incoming message qualifies."""
+    sel = (selection_text or "").strip()
     texts = []
     for msg in iter_contact_messages(contact_uuid):
         if (msg.get("direction") or "").lower() not in ("incoming", "in"):
@@ -751,10 +755,13 @@ def survey_other_texts(contact_uuid, flow_uuid, before_iso):
             continue
         created = msg.get("created_on") or ""
         if before_iso and created >= before_iso:
-            continue  # the valid selection (or anything after it)
+            continue
         t = (msg.get("text") or "").strip()
-        if t:
-            texts.append((created, t))
+        if not t:
+            continue
+        if sel and t == sel:
+            continue  # the valid selection — already represented in column F
+        texts.append((created, t))
     texts.sort(key=lambda x: x[0])  # oldest-first; API returns newest-first
     out = []
     for _, t in texts:
@@ -796,7 +803,10 @@ def survey_row(run, option_key, freetext_key, flow_uuid, other_node):
         # final result was set by a valid selection, which is excluded.
         result_time = ("" if category == "Other"
                        else (values.get(option_key) or {}).get("time", "") or "")
-        parts.extend(survey_other_texts(contact_uuid, flow_uuid, result_time))
+        selection = ("" if category == "Other"
+                     else (values.get(option_key) or {}).get("value", "") or "")
+        parts.extend(survey_other_texts(contact_uuid, flow_uuid,
+                                        result_time, selection))
 
     elaboration = ((values.get(freetext_key) or {}).get("value", "") or "").strip()
     if elaboration and (not parts or parts[-1] != elaboration):
