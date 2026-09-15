@@ -95,6 +95,56 @@ endpoint returns 400).
 **One-time setup:** create the testimonial tab with exactly these headers in row 1:
 `uuid | timestamp | Response | Response timestamp`.
 
+## Follow-up survey log (columns F and G)
+
+Fills two further columns on the **same tab** the testimonial log owns A-D of, from two
+follow-up survey flows sent to that cohort and split by their original Yes/No answer.
+Sibling module to the testimonial log — own reads, own write, lifts out with it.
+
+| Column | Header (exact) | Source |
+|---|---|---|
+| F | `Survey Response (Survey Field)` | the option router's final `category` — the label TEXT ("Busy", not "2"), since the numbers map to different content in each flow |
+| G | `Open-Ended Response (Concat: Other + Free Text)` | the contact's incoming messages on that flow, chronological, joined ` \| ` |
+
+**Targets resolve by HEADER NAME, never by column letter.** A hand-maintained
+`Test #2 Sent? ` column sits at E (note the trailing space in that header). Writing by
+letter would overwrite it.
+
+**This module never touches A-D or E.** Every write names only `uuid`, F and G, and is
+**update-only** (`newrow: "no"`): a survey run whose uuid is not already on the tab is
+counted as `survey_unmatched` and logged, never appended as a partial row.
+
+**Result names are per-flow, not shared** — reading a single `result` key would silently
+miss the second flow:
+
+| Flow | Option result | Free-text result |
+|---|---|---|
+| `SURVEY_YES_FLOW` (…Request - YES) | `result` | `result_3` |
+| `SURVEY_NONR_FLOW` (…Request - NO and NR) | `result_4` | `result_5` |
+
+**Why G comes from `messages.json`, not runs:** the `Other` (unparseable) branch reprompts
+and loops back into the same option router, so TextIt overwrites the result in place. That
+overwrite IS the desired override behaviour — the final valid choice ends up in F with no
+logic needed here — but it also destroys the original unparseable text inside `values`, and
+runs.json carries no message text (`path` is node + time only). That original text is what
+the log is meant to keep, so G is built from the messages endpoint. Note the endpoint has no
+`flow` query param: it is filtered by `contact` and scoped to the flow client-side.
+
+The messages call is made for every run that got a reply. It is **not** skipped when F looks
+like a clean numbered choice, because an overwritten `Other` is indistinguishable from a
+first-try clean answer in runs.json — skipping there would drop exactly the text being
+preserved. The only skip is `responded == False`, where the contact sent nothing at all.
+
+The override applies to `Other` only. `Something Else` (the last numbered option) routes to
+the free-text catcher and terminates, with no path back to the router.
+
+**Endpoints:** runs at the end of `/run` (stats merge under `survey_rows` / `survey_updated`
+/ `survey_unmatched`), and standalone `POST /run-survey`. No-op when unconfigured.
+
+**Accepted risk:** the option routers use `has_number_eq`, so a free-text reply containing a
+digit can misroute (a complaint containing "2" lands in the option-2 bucket). Kept
+deliberately for a small run; revisit for larger campaigns.
+
 ## One-time setup
 
 1. **`Flow` tab header row** — create the tab with exactly these headers in row 1:
@@ -143,6 +193,11 @@ funnel unaffected):
 - `TESTIMONIAL_FLOW` — Video Testimonial Request flow UUID
 - `TESTIMONIAL_SHEET_ID` — the testimonial workbook id (a DIFFERENT workbook from `SHEET_ID`)
 - `TESTIMONIAL_TAB` — the testimonial tab name (default `Sheet1`; set to the actual tab)
+
+Follow-up survey module (optional — unset = survey pass skipped):
+
+- `SURVEY_YES_FLOW` — "…Video Testimonial Request - YES" flow UUID
+- `SURVEY_NONR_FLOW` — "…Video Testimonial Request - NO and NR" flow UUID
 
 ## Rate limit
 

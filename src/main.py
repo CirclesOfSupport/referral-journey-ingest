@@ -101,6 +101,30 @@ TESTIMONIAL_FLOW = os.environ.get("TESTIMONIAL_FLOW")        # Video Testimonial
 TESTIMONIAL_SHEET_ID = os.environ.get("TESTIMONIAL_SHEET_ID")  # its own workbook (NOT SHEET_ID)
 TESTIMONIAL_TAB = os.environ.get("TESTIMONIAL_TAB", "Sheet1")  # tab name; set to the actual tab
 
+# ---- follow-up survey logging (columns F and G of the SAME testimonial tab) ----
+# Two survey flows sent 2026-08-25 to the testimonial cohort, split by their
+# original Yes/No answer. They write F/G on the tab the testimonial module already
+# owns A-D of, so they reuse TESTIMONIAL_SHEET_ID / TESTIMONIAL_TAB. Optional:
+# unset = the survey pass is skipped and nothing else changes.
+#
+# Result names are NOT shared between the two flows (verified against the live
+# definitions 2026-09-14) — reading a single `result` key would silently miss the
+# NO/NR flow entirely, so each flow carries its own option/free-text key pair.
+SURVEY_YES_FLOW = os.environ.get("SURVEY_YES_FLOW")    # "...Request - YES"
+SURVEY_NONR_FLOW = os.environ.get("SURVEY_NONR_FLOW")  # "...Request - NO and NR"
+
+# (flow_uuid_env_value, option_result_key, freetext_result_key)
+# option key  -> the numbered-choice router; its `category` is the label for F.
+# freetext key-> the "Something Else" elaboration catcher (All Responses).
+SURVEY_FLOWS = [
+    (SURVEY_YES_FLOW, "result", "result_3"),
+    (SURVEY_NONR_FLOW, "result_4", "result_5"),
+]
+
+SURVEY_RESPONSE_COL = "Survey Response (Survey Field)"
+SURVEY_FREETEXT_COL = "Open-Ended Response (Concat: Other + Free Text)"
+SURVEY_CONCAT_SEP = " | "
+
 # runtime seatbelt
 PAGE_CEILING = int(os.environ.get("PAGE_CEILING", "500"))
 # Google Sheets API allows 60 read requests/min/user, and sheet-service reads the
@@ -637,6 +661,182 @@ def run_testimonial():
 # ================================================================================
 
 
+# ============================================================== SURVEY LOG (F/G)
+# Fills columns F and G of the SAME tab the testimonial module owns A-D of. It is
+# a sibling module, not an extension: own reads, own row builder, own write, so it
+# lifts out alongside run_testimonial() when the testimonial log graduates to its
+# own service.
+#
+# COLUMN TARGETS ARE RESOLVED BY HEADER NAME, NEVER BY LETTER. The 2026-08-25 call
+# specified "E = survey response, F = open-ended", but a hand-maintained
+# `Test #2 Sent? ` column was inserted at E afterwards, shifting both targets one
+# right to F and G (verified live 2026-09-14). Writing by letter would have
+# overwritten the DM's send-tracking column. sheet-service matches headers exactly
+# — note the live E header carries a TRAILING SPACE.
+#
+# WHAT THIS MODULE MUST NOT TOUCH: columns A-D (owned by run_testimonial) and
+# column E (hand-maintained). Every write here names ONLY uuid + F + G, and is
+# UPDATE-ONLY (`newrow: "no"`) — a survey run whose uuid is not already on the tab
+# is counted and reported, never inserted as a partial row.
+#
+# F  <- the option router's final `category` (the label TEXT, e.g. "Busy", not "2";
+#       the numbers map to DIFFERENT content between the two flows, which is why
+#       the label rather than the number is stored).
+# G  <- concatenation of the contact's incoming messages in that flow, chronological.
+#
+# WHY G COMES FROM messages.json AND NOT runs.json:
+# The `Other` (unparseable) branch reprompts and loops BACK into the same option
+# router, so TextIt OVERWRITES the result in place — which is exactly the override
+# the DM asked for ("if they get routed back and give a valid response, E gets
+# overwritten... keep their original full response in F"), and it needs no logic
+# here because runs.json reports only final state. But that same overwrite DESTROYS
+# the original unparseable text inside `values`, and runs.json carries no message
+# text at all (`path` holds node + time only). The original text is precisely what
+# the DM asked to keep. So G is built from the messages endpoint instead.
+#
+# NOTE the override applies to the `Other` branch ONLY. `Something Else` (the last
+# numbered option) routes to the free-text catcher and TERMINATES — there is no path
+# back to the option router, so a "Something Else then a valid number" override is
+# not possible in the flow as built and is not attempted here.
+
+
+def iter_contact_messages(contact_uuid):
+    """Yield a contact's messages, paginated. Reuses _textit_get so this inherits
+    the 429 and bounded-5xx handling. messages.json is filterable by `contact`
+    (NOT by flow — there is no flow query param), so flow scoping is done
+    client-side by the caller on `.flow.uuid`."""
+    params = {"contact": contact_uuid}
+    url = f"{TEXTIT_BASE}/messages.json"
+    pages = 0
+    while url:
+        pages += 1
+        if pages > PAGE_CEILING:
+            log.warning("page ceiling %s hit for messages of %s",
+                        PAGE_CEILING, contact_uuid)
+            break
+        data = _textit_get(url, params=params)
+        for msg in data.get("results", []):
+            yield msg
+        url = data.get("next")
+        params = None  # next already encodes params
+
+
+def survey_freetext(contact_uuid, flow_uuid):
+    """Concatenate a contact's INCOMING messages on one flow, oldest-first.
+
+    messages.json sorts created_on DESC (newest first), so results are reversed to
+    restore conversational order. Scoped to `direction == incoming` (outgoing are
+    our own prompts) and to this flow, so a contact's traffic on other EA flows
+    never leaks into the cell. Deduplicates consecutive identical texts and skips
+    blanks. Returns '' when the contact sent nothing on this flow."""
+    texts = []
+    for msg in iter_contact_messages(contact_uuid):
+        if (msg.get("direction") or "").lower() not in ("incoming", "in"):
+            continue
+        if ((msg.get("flow") or {}).get("uuid")) != flow_uuid:
+            continue
+        t = (msg.get("text") or "").strip()
+        if t:
+            texts.append((msg.get("created_on") or "", t))
+    texts.sort(key=lambda x: x[0])  # oldest-first; API returns newest-first
+    out = []
+    for _, t in texts:
+        if not out or out[-1] != t:
+            out.append(t)
+    return SURVEY_CONCAT_SEP.join(out)
+
+
+def survey_row(run, option_key, freetext_key, flow_uuid):
+    """Build {uuid, F, G} for one survey run.
+
+    F: the option router's final category. A wait-timeout ("No Response") is
+    normalized to blank by _cat, so F reads as a real label or blank, never the
+    literal words "No Response".
+
+    G: the contact's incoming free text on this flow.
+
+    The messages endpoint is consulted for EVERY run that got a reply. It is
+    tempting to skip it when F holds a clean numbered label and no free-text
+    result exists — but that is precisely the case that must NOT be skipped: an
+    `Other` that was later overwritten by a valid choice looks IDENTICAL in
+    runs.json to a first-try clean answer, because the overwrite is what destroys
+    the evidence. Skipping there would silently drop the original text the DM
+    asked to keep. There is no reliable signal in `values` to tell the two apart,
+    so the only correct read is to ask the messages endpoint.
+
+    The one safe skip is `responded == False`: TextIt sets it when the contact
+    sent nothing at all on the run, so there is no incoming message to find and G
+    is necessarily blank."""
+    values = run.get("values") or {}
+    contact_uuid = (run.get("contact") or {}).get("uuid")
+    category = _cat(values, option_key)
+
+    responded = run.get("responded")
+    freetext = ""
+    if contact_uuid and responded is not False:
+        freetext = survey_freetext(contact_uuid, flow_uuid)
+
+    return {
+        "uuid": contact_uuid,
+        SURVEY_RESPONSE_COL: category,
+        SURVEY_FREETEXT_COL: freetext,
+    }
+
+
+def write_survey_row(row):
+    """UPDATE-ONLY write of F and G, keyed on uuid.
+
+    `newrow: "no"` so a uuid absent from the tab is NEVER appended — this module
+    does not own row creation and must not emit a row with blank A-D. Only uuid,
+    F and G are sent, so A-D (testimonial module) and E (hand-maintained) are
+    untouched by construction. Returns 'updated', or 'unmatched' when the uuid is
+    not on the tab (a 404 from sheet-service, or a zero-match response)."""
+    data = {
+        "tab": TESTIMONIAL_TAB,
+        "key": "uuid",
+        "uuid": row["uuid"],
+        SURVEY_RESPONSE_COL: row.get(SURVEY_RESPONSE_COL, ""),
+        SURVEY_FREETEXT_COL: row.get(SURVEY_FREETEXT_COL, ""),
+        "newrow": "no",
+    }
+    res = _testimonial_write(data, allow_404=True)
+    if res is not None and res.get("matched", 0) > 0:
+        return "updated"
+    return "unmatched"
+
+
+def run_survey():
+    """Read both survey flows' runs and fill F/G on the testimonial tab.
+
+    No watermark: tiny cohort (~34), full pull each time, idempotent uuid-keyed
+    update. A late reply therefore lands on the next run, same property the
+    testimonial pass relies on.
+
+    Returns {} when neither survey flow is configured, so the rest of the service
+    is unaffected if this is not deployed.
+    """
+    configured = [(f, o, x) for (f, o, x) in SURVEY_FLOWS if f]
+    if not configured or not TESTIMONIAL_SHEET_ID:
+        return {}
+    stats = {"survey_rows": 0, "survey_updated": 0, "survey_unmatched": 0}
+    for flow_uuid, option_key, freetext_key in configured:
+        for run in iter_runs(flow_uuid):  # no `after` — full pull, tiny cohort
+            row = survey_row(run, option_key, freetext_key, flow_uuid)
+            if not row["uuid"]:
+                continue
+            outcome = write_survey_row(row)
+            time.sleep(WRITE_PACE_SEC)
+            stats["survey_rows"] += 1
+            stats["survey_" + outcome] += 1
+    if stats["survey_unmatched"]:
+        log.warning("survey: %s run(s) had no matching uuid on the tab",
+                    stats["survey_unmatched"])
+    return stats
+
+
+# ================================================================================
+
+
 def run_ingest(rebuild=False):
     # Single watermark derived from the Flow tab (max last_modified). Used for all
     # flows; None on a rebuild or an empty tab => full pull.
@@ -712,6 +912,11 @@ def run_ingest(rebuild=False):
     #    to its own service, delete this call and the module above.
     stats.update(run_testimonial())
 
+    # 6) follow-up survey log — fills F/G on the testimonial tab. Runs AFTER the
+    #    testimonial pass so A-D exist for any row it needs to match; it is
+    #    update-only and reports unmatched uuids rather than inserting them.
+    stats.update(run_survey())
+
     return stats
 
 
@@ -735,6 +940,25 @@ def run_testimonial_endpoint():
         stats = run_testimonial()
     except Exception as e:
         log.exception("testimonial ingest failed")
+        return jsonify({"status": "error", "error": str(e), "started": started}), 500
+    return jsonify({"status": "ok", "started": started, **stats})
+
+
+@app.route("/run-survey", methods=["POST"])
+def run_survey_endpoint():
+    """Survey log (F/G) only — nothing else touched. Lets the survey pass be run
+    and verified on its own, and becomes the standalone service's `/run` if the
+    testimonial log graduates."""
+    started = datetime.now(timezone.utc).isoformat()
+    if not (SURVEY_YES_FLOW or SURVEY_NONR_FLOW) or not TESTIMONIAL_SHEET_ID:
+        return jsonify({"status": "error",
+                        "error": "SURVEY_YES_FLOW / SURVEY_NONR_FLOW / "
+                                 "TESTIMONIAL_SHEET_ID not configured",
+                        "started": started}), 400
+    try:
+        stats = run_survey()
+    except Exception as e:
+        log.exception("survey ingest failed")
         return jsonify({"status": "error", "error": str(e), "started": started}), 500
     return jsonify({"status": "ok", "started": started, **stats})
 
