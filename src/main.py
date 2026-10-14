@@ -33,12 +33,13 @@ Design notes:
 Endpoints:
   GET  /health -> {"status":"ok"}
   POST /run    -> incremental (default) or {"rebuild": true}
+  POST /run-testimonial, /run-survey, /run-acmf-survey -> one module only
 """
 import os
 import re
 import time
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 import requests
@@ -873,6 +874,796 @@ def run_survey():
 # ================================================================================
 
 
+# ======================================================= ACMF SURVEY ANSWER LOG
+# Self-contained module: one row per contact who received either ACMF follow-up
+# survey flow ("Declined" and "No Response"), written to its own tab of the referral-log
+# workbook (SHEET_ID). Own reads, own row builder, own writes; it touches no
+# other tab. Optional: when its three env vars are unset the pass is skipped.
+#
+# Every answer and every path is captured ("too much info rather than not enough");
+# the tab shows 14 readable columns and the rest of the run sits in `details`:
+# timing, the number
+# question (with any rejected replies), the random message variant, the
+# free-text answer and what the inbound catch-all did with it (classifier
+# bucket, humble line, crisis numbers, triage review, counselor determination),
+# the yes/no question (with the re-referral it starts), the 6-hour reminder,
+# the closing message, replies after the run ended, and the full step trail.
+#
+# HOW NODES ARE IDENTIFIED. No node uuid is hard-coded. Both flow definitions
+# are read live (definitions.json, dependencies=none) on every call and each
+# node's role is derived from its shape:
+#   - waits:          routers with a message wait, named by their result key
+#   - humble re-prompt: the message on a wait's "Other" branch that loops back
+#                     into the same wait
+#   - window check:   a router whose operand calls format_datetime; its exit to
+#                     a message node is the reminder, its exit to a wait is a
+#                     hold (out of the daytime window, back to waiting)
+#   - re-referral:    the Enter-a-Flow node on the yes/no wait's "yes" branch
+# so editing message text or moving nodes in TextIt does not break the log.
+#
+# Result keys (runs.json snake_cases the flow's result names) are per flow and
+# were verified against the live definitions; the number question is
+# `result_2` in both flows.
+#
+# WHY messages.json AS WELL AS runs.json. A run's `values` keep only the LAST
+# answer per wait (a humble re-prompt overwrites the rejected reply), and runs
+# carry no message text. Rejected replies, the first-reply time, the messages
+# the flow sent, what the catch-all sent and replies after the run ended come
+# from the contact's messages, scoped client-side (messages.json has no `flow`
+# filter). The catch-all, crisis-numbers, triage and request-call activity come
+# from the contact's other runs in the same window.
+#
+# WRITES. The tab is read once; rows are upserted keyed on `uuid` (the contact) — a
+# new contact is appended, a changed row is updated in place, an unchanged row is
+# not written. A contact's latest survey run is the row; earlier runs are named in
+# `details`. One write per row, paced WRITE_PACE_SEC. Before any write the header
+# row is checked: a missing column stops the pass and names every missing one.
+
+ACMF_DECLINED_FLOW = os.environ.get("ACMF_DECLINED_FLOW")
+ACMF_NR_FLOW = os.environ.get("ACMF_NR_FLOW")
+ACMF_SURVEY_TAB = os.environ.get("ACMF_SURVEY_TAB")
+
+ACMF_RUN_FIELDS = [
+    "run uuid", "uuid", "name", "survey", "started", "first reply at", "ended",
+    "minutes to first reply", "how it ended", "interrupted by", "messages sent",
+    "q1 reply", "q1 choice", "q1 choice meaning", "q1 answered at",
+    "q1 rejected replies", "message variant", "free-text question",
+    "free-text answer", "free-text answered at", "catch-all category",
+    "humble line sent", "crisis numbers sent", "triage started",
+    "counselor determination", "determination at", "yes/no question",
+    "yes/no reply", "yes/no answer", "yes/no rejected replies",
+    "yes/no answered at", "re-referral step", "ACMF form result",
+    "Referrals sheet result", "reminder sent", "reminder after",
+    "reminder sent at", "window holds", "closing message", "replies after end",
+    "step trail",
+]
+# The tab's 14 columns, A to N (Logan, 2026-10-14: the 41-field row was too much for
+# the program lead to read). Every other field of ACMF_RUN_FIELDS goes into
+# `details`, one "label: value" per line.
+ACMF_SURVEY_COLUMNS = [
+    "name", "uuid", "survey", "sent", "status", "option chosen", "message shown",
+    "their words", "triage", "wants follow-up", "re-referred", "reminder",
+    "replied after survey", "details",
+]
+ACMF_DETAIL_FIELDS = [
+    "run uuid", "started", "first reply at", "ended", "minutes to first reply",
+    "how it ended", "interrupted by", "messages sent", "q1 reply", "q1 answered at",
+    "q1 rejected replies", "free-text question", "free-text answered at",
+    "catch-all category", "humble line sent", "crisis numbers sent", "triage started",
+    "yes/no question", "yes/no reply", "yes/no rejected replies", "yes/no answered at",
+    "re-referral step", "ACMF form result", "Referrals sheet result",
+    "reminder sent at", "window holds", "closing message", "step trail",
+]
+ACMF_DETAILS_MAX = 45000
+# One row per contact: the tab has no run column, so rows are keyed on `uuid` and a
+# contact's latest survey run is the row; any earlier run is named in `details`.
+ACMF_KEY_COL = "uuid"
+ACMF_REPLIES_AFTER_DAYS = 3
+ACMF_JOIN = " | "
+
+
+def _acmf_flow_configs():
+    """(flow uuid, survey label, q1 key, yes/no key, free-text keys, variant key)
+    for each configured flow. Free-text keys are in the order of the q1 options
+    that lead to them."""
+    out = []
+    if ACMF_DECLINED_FLOW:
+        out.append((ACMF_DECLINED_FLOW, "Declined", "result_2", "result_6",
+                    ["result_3", "result_4", "result_5"], "message_variant"))
+    if ACMF_NR_FLOW:
+        out.append((ACMF_NR_FLOW, "No Response", "result_2", "result_5",
+                    ["result_3", "result_4"], None))
+    return out
+
+
+def _acmf_configured():
+    return bool(ACMF_SURVEY_TAB and (ACMF_DECLINED_FLOW or ACMF_NR_FLOW))
+
+
+# ---------------------------------------------------------------- time helpers
+def _parse_iso(s):
+    """TextIt ISO timestamp -> aware datetime, or None. Comparisons go through
+    datetimes, never strings: TextIt mixes precisions ('...58Z', '...58.123Z')."""
+    if not s:
+        return None
+    try:
+        return datetime.fromisoformat(str(s).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _et_short(iso_utc):
+    """'MM-DD HH:MM' Eastern, for the step trail."""
+    dt = _parse_iso(iso_utc)
+    return dt.astimezone(_ET).strftime("%m-%d %H:%M") if dt else ""
+
+
+def _result_key(name):
+    """A flow's result name as runs.json keys it ('Result 2' -> 'result_2')."""
+    return re.sub(r"[^a-z0-9]+", "_", (name or "").strip().lower()).strip("_")
+
+
+def _first_words(text, n=8):
+    words = (text or "").split()
+    return " ".join(words[:n]) + ("…" if len(words) > n else "")
+
+
+# ---------------------------------------------------------------- reads
+def fetch_flow_definition(flow_uuid):
+    """The live definition of exactly this flow (dependencies=none, matched on
+    uuid — never flows[0], which can be a dependency)."""
+    data = _textit_get(f"{TEXTIT_BASE}/definitions.json",
+                       params={"flow": flow_uuid, "dependencies": "none"})
+    for fl in data.get("flows", []):
+        if fl.get("uuid") == flow_uuid:
+            return fl
+    raise RuntimeError(f"definition for flow {flow_uuid} not returned")
+
+
+def _iter_pages(path, params):
+    url = f"{TEXTIT_BASE}/{path}"
+    pages = 0
+    while url:
+        pages += 1
+        if pages > PAGE_CEILING:
+            log.warning("page ceiling %s hit for %s %s", PAGE_CEILING, path, params)
+            break
+        data = _textit_get(url, params=params)
+        for item in data.get("results", []):
+            yield item
+        url = data.get("next")
+        params = None
+
+
+def contact_activity(contact_uuid, since_iso):
+    """A contact's messages and runs from `since_iso` on (both endpoints filter
+    `after`), oldest-first."""
+    msgs = list(_iter_pages("messages.json",
+                            {"contact": contact_uuid, "after": since_iso}))
+    runs = list(_iter_pages("runs.json",
+                            {"contact": contact_uuid, "after": since_iso}))
+    epoch = datetime.min.replace(tzinfo=timezone.utc)
+    msgs.sort(key=lambda m: _parse_iso(m.get("created_on")) or epoch)
+    runs.sort(key=lambda r: _parse_iso(r.get("created_on")) or epoch)
+    return msgs, runs
+
+
+# ---------------------------------------------------------------- flow shape
+def flow_shape(definition):
+    """Derive every node role the row builder needs from a live definition."""
+    nodes = {n["uuid"]: n for n in definition.get("nodes", [])}
+    shape = {
+        "nodes": nodes,
+        "msg_text": {},       # node -> message text
+        "waits": {},          # node -> result key
+        "wait_by_key": {},    # result key -> node
+        "humble": {},         # humble node -> the wait it loops back to
+        "window": set(),      # window-check router nodes
+        "reminder": set(),    # message nodes reached from a window check
+        "enter": {},          # node -> (flow uuid, flow name)
+        "rereferral": None,   # enter node on the yes/no "yes" branch
+        "kind": {},           # node -> short label for the step trail
+    }
+    for uid, n in nodes.items():
+        for a in n.get("actions", []):
+            t = a.get("type")
+            if t == "send_msg":
+                shape["msg_text"][uid] = a.get("text", "")
+            elif t == "enter_flow":
+                fl = a.get("flow") or {}
+                shape["enter"][uid] = (fl.get("uuid"), fl.get("name", ""))
+        r = n.get("router") or {}
+        if r.get("wait") and r.get("result_name"):
+            key = _result_key(r["result_name"])
+            shape["waits"][uid] = key
+            shape["wait_by_key"][key] = uid
+        if "format_datetime" in (r.get("operand") or "") and not r.get("wait"):
+            shape["window"].add(uid)
+
+    def dest(node, exit_uuid):
+        for e in node.get("exits", []):
+            if e.get("uuid") == exit_uuid:
+                return e.get("destination_uuid")
+        return None
+
+    for uid in shape["waits"]:
+        r = nodes[uid]["router"]
+        for c in r.get("categories", []):
+            d = dest(nodes[uid], c.get("exit_uuid"))
+            if c.get("name") == "Other" and d in shape["msg_text"]:
+                back = [e.get("destination_uuid") for e in nodes[d].get("exits", [])]
+                if uid in back:
+                    shape["humble"][d] = uid
+    for uid in shape["window"]:
+        for e in nodes[uid].get("exits", []):
+            d = e.get("destination_uuid")
+            if d in shape["msg_text"]:
+                shape["reminder"].add(d)
+    return shape
+
+
+def _yesno_branch_enter(shape, yesno_key):
+    """The Enter-a-Flow node on the yes/no wait's 'yes' branch (the re-referral)."""
+    wnode = shape["wait_by_key"].get(yesno_key)
+    if not wnode:
+        return None
+    n = shape["nodes"][wnode]
+    for c in n["router"].get("categories", []):
+        if (c.get("name") or "").strip().lower() == "yes":
+            for e in n.get("exits", []):
+                if e.get("uuid") == c.get("exit_uuid"):
+                    d = e.get("destination_uuid")
+                    return d if d in shape["enter"] else None
+    return None
+
+
+def _node_label(shape, uid, cfg):
+    _, _, q1_key, yesno_key, ft_keys, _ = cfg
+    n = shape["nodes"].get(uid) or {}
+    if uid in shape["waits"]:
+        k = shape["waits"][uid]
+        if k == q1_key:
+            return "q1 wait"
+        if k == yesno_key:
+            return "yes/no wait"
+        if k in ft_keys:
+            return f"free-text wait ({k})"
+        return f"wait ({k})"
+    if uid in shape["humble"]:
+        return "humble re-prompt"
+    if uid in shape["reminder"]:
+        return "reminder"
+    if uid in shape["window"]:
+        return "window check"
+    if uid in shape["enter"]:
+        return "enter " + shape["enter"][uid][1]
+    if uid in shape["msg_text"]:
+        return 'msg "' + _first_words(shape["msg_text"][uid], 6) + '"'
+    r = n.get("router") or {}
+    if r.get("type") == "random":
+        return "random split"
+    for a in n.get("actions", []):
+        if a.get("type") == "set_contact_field":
+            key = (a.get("field") or {}).get("key", "")
+            val = a.get("value")
+            return f"{key}={val}" if val else f"{key} cleared"
+    return uid[:8]
+
+
+def choice_meanings(text):
+    """{'1': 'I found other support', ...} from the number question's message."""
+    out = {}
+    for line in (text or "").splitlines():
+        m = re.match(r"\s*(\d+)\)\s*(.+?)\s*$", line)
+        if m:
+            out[m.group(1)] = m.group(2)
+    return out
+
+
+# ---------------------------------------------------------------- row builder
+def _value(values, key, field="value"):
+    return ((values.get(key) or {}).get(field) or "")
+
+
+def _answered(values, key):
+    """A wait's result only counts as an answer when its category is a real one
+    (not the timeout's 'No Response', not a still-pending 'Other')."""
+    cat = _value(values, key, "category")
+    return bool(cat) and cat not in ("No Response", "Other")
+
+
+def _rejected(flow_msgs, after_dt, before_dt, selection):
+    """Incoming replies to this flow in (after_dt, before_dt) that are not the
+    accepted selection — the replies a humble re-prompt turned away. The
+    selection text is dropped explicitly because a message is stamped on
+    receipt, a fraction before the result time that bounds the window."""
+    sel = (selection or "").strip()
+    out = []
+    for m in flow_msgs:
+        if m["_dir"] != "in":
+            continue
+        dt = m["_dt"]
+        if after_dt and dt and dt <= after_dt:
+            continue
+        if before_dt and dt and dt >= before_dt:
+            continue
+        t = (m.get("text") or "").strip()
+        if not t or (sel and t == sel):
+            continue
+        if not out or out[-1] != t:
+            out.append(t)
+    return ACMF_JOIN.join(out)
+
+
+def _dir(m):
+    d = (m.get("direction") or "").lower()
+    return "in" if d in ("in", "incoming") else "out"
+
+
+def acmf_survey_row(run, cfg, shape, msgs, other_runs, now=None):
+    """Build the full row for one survey run. `msgs` / `other_runs` are the
+    contact's messages and runs since shortly before the run started."""
+    flow_uuid, label, q1_key, yesno_key, ft_keys, variant_key = cfg
+    now = now or datetime.now(timezone.utc)
+    values = run.get("values") or {}
+    contact = run.get("contact") or {}
+    path = run.get("path") or []
+    path_nodes = [p.get("node") for p in path]
+    created_dt = _parse_iso(run.get("created_on"))
+    exited_dt = _parse_iso(run.get("exited_on"))
+    end_dt = exited_dt or now
+
+    for m in msgs:
+        m["_dt"] = _parse_iso(m.get("created_on"))
+        m["_dir"] = _dir(m)
+    flow_msgs = [m for m in msgs
+                 if ((m.get("flow") or {}).get("uuid")) == flow_uuid
+                 and m["_dt"] and created_dt and m["_dt"] >= created_dt
+                 and m["_dt"] <= end_dt]
+    first_in = next((m for m in flow_msgs if m["_dir"] == "in"), None)
+
+    row = {c: "" for c in ACMF_RUN_FIELDS}
+    row["_q1 timed out"] = False
+    row["_reminder after kind"] = ""
+    row["_started utc"] = run.get("created_on") or ""
+    row["run uuid"] = run.get("uuid", "")
+    row["uuid"] = contact.get("uuid", "")
+    row["name"] = contact.get("name") or ""
+    row["survey"] = label
+    row["started"] = _to_et(run.get("created_on"))
+    row["ended"] = _to_et(run.get("exited_on")) if run.get("exited_on") else ""
+    row["how it ended"] = run.get("exit_type") or "waiting"
+    row["messages sent"] = str(sum(1 for m in flow_msgs if m["_dir"] == "out"))
+    if first_in:
+        row["first reply at"] = _to_et(first_in.get("created_on"))
+        if created_dt:
+            row["minutes to first reply"] = (
+                f"{(first_in['_dt'] - created_dt).total_seconds() / 60:.1f}")
+
+    if row["how it ended"] == "interrupted" and exited_dt:
+        nxt = [r for r in other_runs
+               if ((r.get("flow") or {}).get("uuid")) != flow_uuid
+               and _parse_iso(r.get("created_on"))
+               and _parse_iso(r.get("created_on")) >= exited_dt - timedelta(seconds=5)]
+        if nxt:
+            row["interrupted by"] = (nxt[0].get("flow") or {}).get("name", "")
+
+    # --- q1, the number question
+    meanings = choice_meanings(shape["msg_text"].get(path_nodes[0], "")) if path_nodes else {}
+    q1_cat = _value(values, q1_key, "category")
+    q1_dt = _parse_iso(_value(values, q1_key, "time"))
+    if _answered(values, q1_key):
+        row["q1 reply"] = _value(values, q1_key)
+        row["q1 choice"] = q1_cat
+        row["q1 choice meaning"] = meanings.get(q1_cat, "")
+        row["q1 answered at"] = _to_et(_value(values, q1_key, "time"))
+    elif q1_cat == "Other":
+        row["q1 reply"] = _value(values, q1_key)
+    q1_wait = shape["wait_by_key"].get(q1_key)
+    if not _answered(values, q1_key):
+        row["_q1 timed out"] = q1_cat == "No Response" or any(
+            n == q1_wait and i + 1 < len(path_nodes) and path_nodes[i + 1] in shape["window"]
+            for i, n in enumerate(path_nodes))
+    q1_humble = [h for h, w in shape["humble"].items() if w == q1_wait]
+    if any(h in path_nodes for h in q1_humble):
+        before = q1_dt if _answered(values, q1_key) else None
+        row["q1 rejected replies"] = _rejected(
+            flow_msgs, None, before,
+            _value(values, q1_key) if _answered(values, q1_key) else "")
+
+    if variant_key:
+        row["message variant"] = _value(values, variant_key, "category")
+
+    # --- free text (at most one per run: one per q1 option)
+    for k in ft_keys:
+        wnode = shape["wait_by_key"].get(k)
+        if wnode not in path_nodes:
+            continue
+        idx = path_nodes.index(wnode)
+        q = next((path_nodes[i] for i in range(idx - 1, -1, -1)
+                  if path_nodes[i] in shape["msg_text"]
+                  and path_nodes[i] not in shape["humble"]), None)
+        row["free-text question"] = shape["msg_text"].get(q, "") if q else ""
+        if _value(values, k):
+            row["free-text answer"] = _value(values, k)
+            row["free-text answered at"] = _to_et(_value(values, k, "time"))
+            _catch_all(row, run, values, k, shape, path, msgs, other_runs, flow_uuid)
+        break
+
+    # --- yes/no
+    yn_wait = shape["wait_by_key"].get(yesno_key)
+    if yn_wait in path_nodes:
+        idx = path_nodes.index(yn_wait)
+        q = next((path_nodes[i] for i in range(idx - 1, -1, -1)
+                  if path_nodes[i] in shape["msg_text"]
+                  and path_nodes[i] not in shape["humble"]), None)
+        row["yes/no question"] = shape["msg_text"].get(q, "") if q else ""
+        yn_cat = _value(values, yesno_key, "category")
+        if _answered(values, yesno_key):
+            row["yes/no reply"] = _value(values, yesno_key)
+            row["yes/no answer"] = yn_cat.strip().capitalize()
+            row["yes/no answered at"] = _to_et(_value(values, yesno_key, "time"))
+        else:
+            row["yes/no reply"] = _value(values, yesno_key) if yn_cat == "Other" else ""
+            row["yes/no answer"] = "no response"
+        yn_humble = [h for h, w in shape["humble"].items() if w == yn_wait]
+        if any(h in path_nodes for h in yn_humble):
+            yn_dt = _parse_iso(_value(values, yesno_key, "time"))
+            row["yes/no rejected replies"] = _rejected(
+                flow_msgs, q1_dt if _answered(values, q1_key) else None,
+                yn_dt if _answered(values, yesno_key) else None,
+                _value(values, yesno_key) if _answered(values, yesno_key) else "")
+
+    # --- re-referral (the request-call step on "yes")
+    rr = _yesno_branch_enter(shape, yesno_key)
+    if rr and rr in path_nodes:
+        t = _parse_iso(path[path_nodes.index(rr)].get("time"))
+        child_flow = shape["enter"][rr][0]
+        child = next((r for r in other_runs
+                      if ((r.get("flow") or {}).get("uuid")) == child_flow
+                      and t and _parse_iso(r.get("created_on"))
+                      and abs((_parse_iso(r.get("created_on")) - t).total_seconds()) <= 120),
+                     None)
+        if child:
+            row["re-referral step"] = child.get("exit_type") or "running"
+            cv = child.get("values") or {}
+            for col, key in (("ACMF form result", "acmf_submission"),
+                             ("Referrals sheet result", "sheet_log")):
+                if cv.get(key):
+                    cat = cv[key].get("category") or ""
+                    val = cv[key].get("value") or ""
+                    row[col] = f"{cat} ({val})" if val else cat
+        else:
+            row["re-referral step"] = "entered (child run not found)"
+
+    # --- reminder and window holds
+    holds = 0
+    for i, n in enumerate(path_nodes):
+        if n in shape["window"]:
+            nxt = path_nodes[i + 1] if i + 1 < len(path_nodes) else None
+            if nxt in shape["waits"]:
+                holds += 1
+        if n in shape["reminder"]:
+            row["reminder sent"] = "yes"
+            row["reminder sent at"] = _to_et(path[i].get("time"))
+            w = next((path_nodes[j] for j in range(i - 1, -1, -1)
+                      if path_nodes[j] in shape["waits"]), None)
+            row["reminder after"] = _node_label(shape, w, cfg) if w else ""
+            wk = shape["waits"].get(w, "")
+            row["_reminder after kind"] = (
+                "the number question" if wk == q1_key else
+                "the yes/no question" if wk == yesno_key else
+                "the free-text question" if wk in ft_keys else "")
+    if not row["reminder sent"]:
+        row["reminder sent"] = "no"
+    row["window holds"] = str(holds)
+
+    # --- ending
+    last_msg = next((n for n in reversed(path_nodes) if n in shape["msg_text"]), None)
+    if run.get("exit_type") and last_msg:
+        row["closing message"] = _first_words(shape["msg_text"][last_msg])
+    if exited_dt:
+        horizon = exited_dt + timedelta(days=ACMF_REPLIES_AFTER_DAYS)
+        after = [(m.get("text") or "").strip() for m in msgs
+                 if m["_dir"] == "in" and m["_dt"]
+                 and exited_dt < m["_dt"] <= horizon and (m.get("text") or "").strip()]
+        row["replies after end"] = ACMF_JOIN.join(after)
+    row["step trail"] = " › ".join(
+        f"{_et_short(p.get('time'))} {_node_label(shape, p.get('node'), cfg)}"
+        for p in path)
+    return row
+
+
+def _catch_all(row, run, values, key, shape, path, msgs, other_runs, flow_uuid):
+    """What the inbound catch-all did with a free-text answer. The survey enters
+    it as a subflow right after the answer; its runs and messages fall between
+    the answer and the survey's next step after the Enter-a-Flow node."""
+    path_nodes = [p.get("node") for p in path]
+    wnode = shape["wait_by_key"].get(key)
+    i = path_nodes.index(wnode)
+    enter_i = next((j for j in range(i + 1, len(path_nodes))
+                    if path_nodes[j] in shape["enter"]), None)
+    start = _parse_iso(_value(values, key, "time"))
+    if enter_i is None or not start:
+        row["catch-all category"] = "not entered"
+        return
+    end_i = enter_i + 1
+    end = _parse_iso(path[end_i].get("time")) if end_i < len(path) else None
+    lo = start - timedelta(seconds=2)
+    hi = (end or datetime.now(timezone.utc)) + timedelta(seconds=2)
+
+    window_runs = [r for r in other_runs
+                   if _parse_iso(r.get("created_on"))
+                   and lo <= _parse_iso(r.get("created_on")) <= hi]
+    umf = next((r for r in window_runs if "bucket" in (r.get("values") or {})
+                or ((r.get("values") or {}).get("referring_flow_id") or {}).get("value")
+                == flow_uuid and "message_id" in (r.get("values") or {})), None)
+    umf_flow = ((umf or {}).get("flow") or {}).get("uuid")
+    uv = (umf or {}).get("values") or {}
+    row["catch-all category"] = (uv.get("bucket") or {}).get("value") or (
+        "not classified" if umf else "catch-all run not found")
+
+    window_out = [m for m in msgs if m["_dir"] == "out" and m["_dt"]
+                  and lo <= m["_dt"] <= hi
+                  and ((m.get("flow") or {}).get("uuid")) != flow_uuid]
+    row["humble line sent"] = "yes" if any(
+        ((m.get("flow") or {}).get("uuid")) == umf_flow
+        and "humble chatbot" in (m.get("text") or "").lower()
+        for m in window_out) else "no"
+    row["crisis numbers sent"] = "yes" if any(
+        ((m.get("flow") or {}).get("uuid")) != umf_flow
+        and "988" in (m.get("text") or "")
+        for m in window_out) else "no"
+    row["triage started"] = "yes" if any(
+        "triagerequestid" in (r.get("values") or {}) for r in window_runs) else "no"
+
+    msg_id = (uv.get("message_id") or {}).get("value")
+    if msg_id:
+        det = [r for r in other_runs
+               if ((r.get("values") or {}).get("message_id") or {}).get("value") == msg_id
+               and "determination" in (r.get("values") or {})]
+        if det:
+            d = det[-1]
+            row["counselor determination"] = d["values"]["determination"].get("value", "")
+            row["determination at"] = _to_et(d.get("created_on"))
+
+
+# ---------------------------------------------------------------- the tab's row
+def _form_ok(result):
+    """'Success (200)' -> True when the code in brackets is 2xx."""
+    m = re.search(r"\((\d{3})\)\s*$", result or "")
+    return bool(m) and m.group(1).startswith("2")
+
+
+def acmf_details(full, other_runs=()):
+    """Every field not given its own column, one 'label: value' per line, empty
+    ones omitted, under ACMF_DETAILS_MAX characters — the step trail is cut
+    first, and the cell says so."""
+    lines = [f"{f}: {full.get(f)}" for f in ACMF_DETAIL_FIELDS
+             if f != "step trail" and str(full.get(f, "") or "").strip()]
+    if other_runs:
+        lines.append("other survey runs: " + "; ".join(other_runs))
+    trail = str(full.get("step trail", "") or "")
+    head = "\n".join(lines)
+    if not trail:
+        return head
+    line = f"step trail: {trail}"
+    room = ACMF_DETAILS_MAX - len(head) - 1
+    if len(line) > room:
+        steps = trail.split(" › ")
+        kept = []
+        for st in steps:
+            note = (f"step trail (cut to fit the cell: first {len(kept) + 1} of "
+                    f"{len(steps)} steps): ")
+            if len(note) + len(" › ".join(kept + [st])) > room:
+                break
+            kept.append(st)
+        line = (f"step trail (cut to fit the cell: first {len(kept)} of {len(steps)} "
+                f"steps): " + " › ".join(kept))
+    return (head + "\n" + line) if head else line
+
+
+def acmf_sheet_row(full, other_runs=()):
+    """The 14-column row from the full field set acmf_survey_row() builds."""
+    ended = full.get("how it ended")
+    if ended == "waiting":
+        status = "Waiting"
+    elif ended == "interrupted":
+        status = ("Cut short by " + full["interrupted by"]) if full.get("interrupted by") \
+            else "Cut short"
+    elif ended == "expired":
+        status = "Expired"
+    elif full.get("reminder sent") == "yes":
+        status = "No reply, reminder sent"
+    else:
+        status = "Answered"
+    if full.get("q1 choice"):
+        option = full["q1 choice"] + " – " + (full.get("q1 choice meaning") or "")
+    elif full.get("_q1 timed out"):
+        option = "No reply"
+    else:
+        option = ""
+    triage = ""
+    if full.get("counselor determination"):
+        triage = full["counselor determination"] + (
+            ", " + full["determination at"] if full.get("determination at") else "")
+    rr = ""
+    if full.get("re-referral step"):
+        form = full.get("ACMF form result", "")
+        if full["re-referral step"] == "completed" and _form_ok(form):
+            rr = "sent to ACMF"
+        else:
+            rr = f"failed ({form or 'no form result'})"
+    reminder = ""
+    if full.get("reminder sent") == "yes":
+        reminder = "after " + (full.get("_reminder after kind") or full.get("reminder after") or "")
+    return {
+        "name": full.get("name", ""),
+        "uuid": full.get("uuid", ""),
+        "survey": full.get("survey", ""),
+        "sent": full.get("started", ""),
+        "status": status,
+        "option chosen": option,
+        "message shown": full.get("message variant", ""),
+        "their words": full.get("free-text answer", ""),
+        "triage": triage,
+        "wants follow-up": full.get("yes/no answer", ""),
+        "re-referred": rr,
+        "reminder": reminder,
+        "replied after survey": full.get("replies after end", ""),
+        "details": acmf_details(full, other_runs),
+    }
+
+
+def acmf_rows_by_contact(full_rows):
+    """One tab row per contact: the latest run (by start), earlier runs named."""
+    by = {}
+    for r in full_rows:
+        if r.get("uuid"):
+            by.setdefault(r["uuid"], []).append(r)
+    out = []
+    for runs in by.values():
+        runs.sort(key=lambda r: _parse_iso(r.get("_started utc")) or
+                  datetime.min.replace(tzinfo=timezone.utc))
+        latest = runs[-1]
+        others = [f"{r['survey']} run {r['run uuid']} started {r['started']}"
+                  for r in runs[:-1]]
+        out.append(acmf_sheet_row(latest, others))
+    return out
+
+
+# ---------------------------------------------------------------- sheet side
+def _acmf_sheet_post(route, body, allow_404=False):
+    body = dict(body)
+    body["password"] = SHEET_PASSWORD
+    body["sheetid"] = SHEET_ID
+    r = requests.post(f"{SHEET_SERVICE}/{route}", json=body, timeout=60)
+    if allow_404 and r.status_code == 404:
+        return None
+    r.raise_for_status()
+    return r.json()
+
+
+def acmf_missing_headers():
+    """Every expected column the tab's header row lacks. Read with /coordinates
+    on row 1 (a fresh grid read, nocache), which matches header text the same
+    way /write does (case-insensitive, trimmed) — so a column this reports as
+    present is one /write will fill. /read cannot answer this on an empty tab."""
+    coords = [{"sheet": ACMF_SURVEY_TAB, "column": c, "row": "_1",
+               "result_name": f"h{i}"} for i, c in enumerate(ACMF_SURVEY_COLUMNS)]
+    res = _acmf_sheet_post("coordinates", {"coordinates": coords, "nocache": True})
+    return [c for i, c in enumerate(ACMF_SURVEY_COLUMNS) if f"h{i}" not in res]
+
+
+def acmf_existing_rows():
+    """One read of the tab -> {run uuid: {column: displayed value}}."""
+    res = _acmf_sheet_post("read", {"tab": ACMF_SURVEY_TAB, "mode": "all"})
+    out = {}
+    for r in res.get("rows") or []:
+        low = {str(k).strip().lower(): v for k, v in r.items()}
+        key = str(low.get(ACMF_KEY_COL) or "").strip()
+        if key:
+            out[key] = {c: str(low.get(c.lower(), "") or "") for c in ACMF_SURVEY_COLUMNS}
+    return out
+
+
+def _sheet_safe(v):
+    """Writes go in as USER_ENTERED, so a reply beginning with = + - @ would be
+    taken as a formula. A leading apostrophe keeps it literal text."""
+    v = "" if v is None else str(v)
+    return "'" + v if v[:1] in ("=", "+", "-", "@") else v
+
+
+_SHEET_DT_FORMATS = ("%Y-%m-%d %H:%M", "%Y-%m-%d %H:%M:%S",
+                     "%m/%d/%Y %H:%M:%S", "%m/%d/%Y %H:%M")
+
+
+def _norm_cell(v):
+    """Compare what we would write with what the sheet displays: dates and
+    numbers are re-rendered by Sheets, so compare them by value."""
+    s = str(v or "").strip()
+    if s.startswith("'"):
+        s = s[1:]
+    for f in _SHEET_DT_FORMATS:
+        try:
+            return datetime.strptime(s, f).strftime("%Y-%m-%d %H:%M")
+        except ValueError:
+            pass
+    try:
+        return repr(float(s))
+    except ValueError:
+        return s
+
+
+def acmf_row_changed(row, existing):
+    return any(_norm_cell(row.get(c, "")) != _norm_cell(existing.get(c, ""))
+               for c in ACMF_SURVEY_COLUMNS)
+
+
+def write_acmf_row(row, exists):
+    data = {"tab": ACMF_SURVEY_TAB, "key": ACMF_KEY_COL}
+    for c in ACMF_SURVEY_COLUMNS:
+        data[c] = _sheet_safe(row.get(c, ""))
+    if exists:
+        res = _acmf_sheet_post("write", {**data, "newrow": "no"}, allow_404=True)
+        if res is not None and res.get("matched", 0) > 0:
+            return "updated"
+    _acmf_sheet_post("write", {**data, "newrow": "yes"})
+    return "inserted"
+
+
+class AcmfHeaderError(RuntimeError):
+    pass
+
+
+def build_acmf_rows():
+    """Read both flows and build the tab's rows (one per contact). Reads only —
+    no sheet call."""
+    full = []
+    for cfg in _acmf_flow_configs():
+        flow_uuid = cfg[0]
+        shape = flow_shape(fetch_flow_definition(flow_uuid))
+        for run in iter_runs(flow_uuid):  # no `after` — full pull, tiny cohort
+            contact_uuid = (run.get("contact") or {}).get("uuid")
+            created = _parse_iso(run.get("created_on"))
+            if not contact_uuid or not created:
+                continue
+            since = (created - timedelta(minutes=1)).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+            msgs, others = contact_activity(contact_uuid, since)
+            full.append(acmf_survey_row(run, cfg, shape, msgs, others))
+    return acmf_rows_by_contact(full)
+
+
+def run_acmf_survey(dry_run=False):
+    """Upsert one row per contact (latest survey run) into ACMF_SURVEY_TAB. Returns {} when not
+    configured. dry_run builds the rows and returns them without any sheet call."""
+    if not _acmf_configured():
+        return {}
+    if not dry_run:
+        missing = acmf_missing_headers()
+        if missing:
+            raise AcmfHeaderError(
+                f"tab '{ACMF_SURVEY_TAB}' is missing column(s): " + ", ".join(missing))
+    rows = build_acmf_rows()
+    if dry_run:
+        return {"acmf_survey_rows": len(rows), "rows": rows}
+    existing = acmf_existing_rows()
+    stats = {"acmf_survey_rows": len(rows), "acmf_survey_inserted": 0,
+             "acmf_survey_updated": 0, "acmf_survey_unchanged": 0}
+    for row in rows:
+        key = row[ACMF_KEY_COL]
+        if key in existing and not acmf_row_changed(row, existing[key]):
+            stats["acmf_survey_unchanged"] += 1
+            continue
+        outcome = write_acmf_row(row, key in existing)
+        time.sleep(WRITE_PACE_SEC)
+        stats["acmf_survey_" + outcome] += 1
+    return stats
+
+
+# ================================================================================
+
+
 def run_ingest(rebuild=False):
     # Single watermark derived from the Flow tab (max last_modified). Used for all
     # flows; None on a rebuild or an empty tab => full pull.
@@ -953,6 +1744,11 @@ def run_ingest(rebuild=False):
     #    update-only and reports unmatched uuids rather than inserting them.
     stats.update(run_survey())
 
+    # 7) ACMF follow-up survey answer log — its own tab of the referral-log
+    #    workbook; no-op unless configured. A missing header raises, so the
+    #    step fails visibly instead of writing a partial log.
+    stats.update(run_acmf_survey())
+
     return stats
 
 
@@ -995,6 +1791,28 @@ def run_survey_endpoint():
         stats = run_survey()
     except Exception as e:
         log.exception("survey ingest failed")
+        return jsonify({"status": "error", "error": str(e), "started": started}), 500
+    return jsonify({"status": "ok", "started": started, **stats})
+
+
+@app.route("/run-acmf-survey", methods=["POST"])
+def run_acmf_survey_endpoint():
+    """ACMF survey answer log only — nothing else touched. Body {"dry_run": true}
+    builds and returns the rows without any sheet call."""
+    started = datetime.now(timezone.utc).isoformat()
+    if not _acmf_configured():
+        return jsonify({"status": "error",
+                        "error": "ACMF_SURVEY_TAB / ACMF_DECLINED_FLOW / ACMF_NR_FLOW "
+                                 "not configured",
+                        "started": started}), 400
+    body = request.get_json(silent=True) or {}
+    try:
+        stats = run_acmf_survey(dry_run=bool(body.get("dry_run")))
+    except AcmfHeaderError as e:
+        log.error("acmf survey: %s", e)
+        return jsonify({"status": "error", "error": str(e), "started": started}), 409
+    except Exception as e:
+        log.exception("acmf survey ingest failed")
         return jsonify({"status": "error", "error": str(e), "started": started}), 500
     return jsonify({"status": "ok", "started": started, **stats})
 

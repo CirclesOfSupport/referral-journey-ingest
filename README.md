@@ -156,6 +156,61 @@ the free-text catcher and terminates, with no path back to the router.
 digit can misroute (a complaint containing "2" lands in the option-2 bucket). Kept
 deliberately for a small run; revisit for larger campaigns.
 
+## ACMF follow-up survey answer log (its own tab)
+
+Two follow-up survey flows ask veterans referred to ACMF what happened next: a
+"Declined" survey (they turned the services down) and a "No Response" survey (they never
+connected). `run_acmf_survey()` writes **one row per contact** to its own tab of the
+referral-log workbook (`ACMF_SURVEY_TAB`, workbook `SHEET_ID`), keyed on `uuid`: a new
+contact is appended, a changed row is updated in place, an unchanged row is not written.
+The row is the contact's latest survey run; any earlier run is named in `details`. Full
+pull of both flows on every call (small cohort, no watermark), so late replies land on
+the next run. It writes no other tab.
+
+**Header check first.** Before any write the tab's row 1 is read (sheet-service
+`/coordinates` on row `_1`, which matches header text the same way `/write` does). If any
+of the 14 columns below is missing the pass stops and names every missing column —
+`/run-acmf-survey` answers 409, and inside `/run` the step fails.
+
+**Node roles are read from the live flow definitions** (`definitions.json`,
+`dependencies=none`) on every call, not hard-coded: waits by result name, the humble
+re-prompt (the message on a wait's `Other` branch that loops back to it), the daytime
+window check (a router on `format_datetime`; its exit to a message is the reminder, its
+exit to a wait is a hold), and the re-referral (the Enter-a-Flow node on the yes/no
+wait's "yes" branch). Result keys per flow: number question `result_2` in both; yes/no
+`result_6` (Declined) / `result_5` (No Response); free text `result_3`–`result_5` /
+`result_3`–`result_4`; Declined's random split saves `message_variant`.
+
+**Sources.** A run's `values` keep only the last answer per wait (a re-prompt overwrites
+the rejected reply) and runs carry no text, so the contact's messages and other runs are
+read too (`messages.json` and `runs.json` with `contact` and `after`, scoped client-side —
+`messages.json` has no `flow` filter).
+
+| Column | Content |
+|---|---|
+| `name`, `uuid` | the contact |
+| `survey` | `Declined` / `No Response` |
+| `sent` | when the survey started (run `created_on`) |
+| `status` | `Waiting`; `Cut short by <next flow>`; `Expired`; `No reply, reminder sent` (the 6-hour reminder went out); otherwise `Answered` |
+| `option chosen` | the number chosen and its wording (`4 – …`, read from the question's own message); `No reply` once the question timed out |
+| `message shown` | Declined option 2 only: the random message variant shown |
+| `their words` | the free-text answer |
+| `triage` | the counselor determination and its time, from the triage review the inbound catch-all started for that answer |
+| `wants follow-up` | the yes/no answer (`Yes` / `No` / `no response`); blank if not asked |
+| `re-referred` | `sent to ACMF` when the request-call step completed with a 2xx form result; `failed (<result>)` when it ran and did not |
+| `reminder` | `after the number / free-text / yes/no question` when the reminder went out |
+| `replied after survey` | incoming messages up to 3 days after the run ended, joined ` \| ` |
+| `details` | everything else, one `label: value` per line, empty ones left out: run uuid, started, first reply at, ended, minutes to first reply, how it ended, interrupted by, messages sent, q1 reply, q1 answered at, q1 rejected replies, free-text question, free-text answered at, catch-all category, humble line sent, crisis numbers sent, triage started, yes/no question, yes/no reply, yes/no rejected replies, yes/no answered at, re-referral step, ACMF form result, Referrals sheet result, reminder sent at, window holds, closing message, other survey runs, step trail (every node with its time). Kept under 45,000 characters; the step trail is cut first and the cell says so |
+
+Times are Eastern, `YYYY-MM-DD HH:MM`. Writes go in as USER_ENTERED, so a value starting
+with `=`, `+`, `-` or `@` is written with a leading apostrophe to stay text.
+
+**Endpoints:** runs at the end of `/run` (stats `acmf_survey_rows` / `_inserted` /
+`_updated` / `_unchanged`), and standalone `POST /run-acmf-survey`; body
+`{"dry_run": true}` returns the built rows with no sheet call. 400 when unconfigured.
+
+**Tests:** `python -m unittest discover -s tests` (synthetic flow, no network).
+
 ## One-time setup
 
 1. **`Flow` tab header row** — create the tab with exactly these headers in row 1:
@@ -177,6 +232,8 @@ POST /run     -> full rebuild:  body {"rebuild": true}   (ignores watermarks, re
 ```
 
 `/run` response: `{"status","mode","flow_rows","inserted","updated","self_heals","skipped_no_provider","outreach_updated","outreach_404","outreach_blank"}`, plus `testimonial_rows`/`testimonial_inserted`/`testimonial_updated` when the testimonial module is configured (see below).
+
+`POST /run-acmf-survey` — the ACMF survey answer log only; `{"dry_run": true}` returns rows without writing.
 
 `POST /run-testimonial` — the testimonial log only (referral funnel untouched); returns `{"status","testimonial_rows","testimonial_inserted","testimonial_updated"}`, or 400 if the testimonial vars are unset.
 
@@ -209,6 +266,13 @@ Follow-up survey module (optional — unset = survey pass skipped):
 
 - `SURVEY_YES_FLOW` — "…Video Testimonial Request - YES" flow UUID
 - `SURVEY_NONR_FLOW` — "…Video Testimonial Request - NO and NR" flow UUID
+
+ACMF survey answer log (optional — unset = the pass is skipped). Create the tab with its
+14 headers in row 1 before setting these:
+
+- `ACMF_DECLINED_FLOW` — the Declined follow-up survey flow UUID
+- `ACMF_NR_FLOW` — the No Response follow-up survey flow UUID
+- `ACMF_SURVEY_TAB` — the tab name in the `SHEET_ID` workbook
 
 ## Rate limit
 
